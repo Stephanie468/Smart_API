@@ -54,6 +54,10 @@ app.get('/', (_req, res) => {
     }
   })
 })
+// Route de ping — garde le serveur éveillé
+app.get('/ping', (_req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() })
+})
 
 // ── Démarrage ─────────────────────────────────────────────────
 app.listen(PORT, () => {
