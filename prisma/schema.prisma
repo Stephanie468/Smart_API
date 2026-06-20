@@ -1,0 +1,393 @@
+// SmartSanté Cameroun — Schéma Prisma (MPD dérivé du MCD Merise)
+// Documentation détaillée : ../docs/PRISMA_MODELES.md
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+   //directUrl = env("DATABASE_URL")
+}
+
+// ─── ÉNUMÉRATIONS ────────────────────────────────────────────
+
+enum RoleUtilisateur {
+  PATIENT
+  MEDECIN
+  ADMIN
+}
+
+enum StatutCompte {
+  ACTIF
+  INACTIF
+  SUSPENDU
+}
+
+enum Langue {
+  FR
+  EN
+}
+
+enum NiveauUrgence {
+  VERT
+  ORANGE
+  ROUGE
+}
+
+enum CanalConversation {
+  WHATSAPP
+  WEB
+}
+
+enum StatutConversation {
+  EN_COURS
+  TERMINEE
+  ABANDONNEE
+}
+
+enum ExpediteurMessage {
+  PATIENT
+  BOT
+  IA
+}
+
+enum TypeFormationSanitaire {
+  HOPITAL
+  CENTRE_SANTE
+  PHARMACIE
+  CLINIQUE
+}
+
+enum StatutRendezVous {
+  EN_ATTENTE
+  CONFIRME
+  ANNULE
+  TERMINE
+}
+
+enum StatutCertification {
+  EN_ATTENTE
+  VALIDE
+  SUSPENDU
+  REJETE
+}
+
+enum TypeNotification {
+  RDV
+  ALERTE_SANTE
+  RAPPEL_MEDICAMENT
+  SYSTEME
+}
+
+enum JourSemaine {
+  LUNDI
+  MARDI
+  MERCREDI
+  JEUDI
+  VENDREDI
+  SAMEDI
+  DIMANCHE
+}
+
+enum StatutAlerte {
+  ACTIVE
+  RESOLUE
+  ARCHIVEE
+}
+
+// ─── UTILISATEURS ────────────────────────────────────────────
+
+/// Compte de base partagé par tous les acteurs.
+model Utilisateur {
+  id             String          @id @default(uuid())
+  nom            String
+  prenom         String
+  email          String?         @unique
+  telephone      String          @unique
+  motDePasseHash String?
+  role           RoleUtilisateur
+  statut         StatutCompte    @default(ACTIF)
+  // OTP intégré directement — évite une table séparée
+  otpCode        String?
+  otpExpiration  DateTime?
+  dateCreation   DateTime        @default(now())
+  dateMiseAJour  DateTime        @updatedAt
+
+  patient        Patient?
+  medecin        Medecin?
+  administrateur Administrateur?
+  notifications  Notification[]
+
+  @@map("utilisateur")
+}
+
+model Patient {
+  id           String      @id
+  utilisateur  Utilisateur @relation(fields: [id], references: [id], onDelete: Cascade)
+  localisation String?
+  region       String?
+  ville        String?
+  langue       Langue      @default(FR)
+  groupeSanguin String?
+  antecedents  String?     @db.Text
+  allergies    String?     @db.Text
+
+  conversations    Conversation[]
+  consultations    ConsultationIA[]
+  rendezVous       RendezVous[]
+  rappels          RappelMedicament[]
+  ordonance        Ordonnance[]
+
+  @@index([region, ville])
+  @@map("patient")
+}
+
+model Medecin {
+  id                  String              @id
+  utilisateur         Utilisateur         @relation(fields: [id], references: [id], onDelete: Cascade)
+  specialite          String
+  numeroOrdre         String              @unique
+  carteProfessionnelleUrl String
+  tarifConsultation   Decimal             @db.Decimal(10, 2)
+  statutCertification StatutCertification @default(EN_ATTENTE)
+  bio                 String?             @db.Text
+  formationSanitaireId String?
+  formationSanitaire  FormationSanitaire? @relation(fields: [formationSanitaireId], references: [id])
+  valideParId         String?
+  validePar           Administrateur?     @relation("ValidationMedecin", fields: [valideParId], references: [id])
+
+  creneaux   Creneau[]
+  rendezVous RendezVous[]
+  ordonnances Ordonnance[]
+
+  @@index([specialite, statutCertification])
+  @@map("medecin")
+}
+
+model Administrateur {
+  id           String      @id
+  utilisateur  Utilisateur @relation(fields: [id], references: [id], onDelete: Cascade)
+  niveauAcces  Int         @default(1)
+
+  medecinsValides Medecin[] @relation("ValidationMedecin")
+
+  @@map("administrateur")
+}
+
+// ─── CHATBOT & IA ─────────────────────────────────────────────
+
+model Conversation {
+  id        String             @id @default(uuid())
+  patientId String
+  patient   Patient            @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  canal     CanalConversation  @default(WHATSAPP)
+  dateDebut DateTime           @default(now())
+  dateFin   DateTime?
+  statut    StatutConversation @default(EN_COURS)
+
+  messages      Message[]
+  consultations ConsultationIA[]
+
+  @@index([patientId, statut])
+  @@map("conversation")
+}
+
+model Message {
+  id             String            @id @default(uuid())
+  conversationId String
+  conversation   Conversation      @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  contenu        String            @db.Text
+  expediteur     ExpediteurMessage
+  horodatage     DateTime          @default(now())
+
+  @@index([conversationId, horodatage])
+  @@map("message")
+}
+
+model Pathologie {
+  id          String  @id @default(uuid())
+  nom         String  @unique
+  code        String  @unique
+  categorie   String
+  description String? @db.Text
+
+  consultations ConsultationPathologie[]
+  alertes       AlerteEpidemiologique[]
+
+  @@map("pathologie")
+}
+
+/// Résultat IA — pré-diagnostic + urgence + suivi intégré
+model ConsultationIA {
+  id               String        @id @default(uuid())
+  patientId        String
+  patient          Patient       @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  conversationId   String?
+  conversation     Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  symptomes        String        @db.Text
+  preDiagnostic    String        @db.Text
+  niveauUrgence    NiveauUrgence
+  scoreConfiance   Float?
+  recommandations  String?       @db.Text  // simplifié : texte au lieu d'une table séparée
+  ficheUrl         String?                 // lien PDF généré
+  // Suivi post-consultation intégré — évite une table séparée
+  suiviDateRelance DateTime?
+  suiviReponse     String?       @db.Text
+  suiviEffectue    Boolean       @default(false)
+  dateConsultation DateTime      @default(now())
+
+  pathologies  ConsultationPathologie[]
+  orientations ConsultationOrientation[]
+
+  @@index([patientId, dateConsultation])
+  @@index([niveauUrgence, dateConsultation])
+  @@map("consultation_ia")
+}
+
+model ConsultationPathologie {
+  consultationId String
+  consultation   ConsultationIA @relation(fields: [consultationId], references: [id], onDelete: Cascade)
+  pathologieId   String
+  pathologie     Pathologie     @relation(fields: [pathologieId], references: [id], onDelete: Cascade)
+  probabilite    Float?
+
+  @@id([consultationId, pathologieId])
+  @@map("consultation_pathologie")
+}
+
+// ─── FORMATIONS SANITAIRES ───────────────────────────────────
+
+model FormationSanitaire {
+  id        String                 @id @default(uuid())
+  nom       String
+  type      TypeFormationSanitaire
+  adresse   String
+  region    String
+  ville     String
+  latitude  Float
+  longitude Float
+  telephone String?
+  horaires  String?
+
+  medecins     Medecin[]
+  orientations ConsultationOrientation[]
+
+  @@index([region, ville, type])
+  @@map("formation_sanitaire")
+}
+
+model ConsultationOrientation {
+  consultationId       String
+  consultation         ConsultationIA     @relation(fields: [consultationId], references: [id], onDelete: Cascade)
+  formationSanitaireId String
+  formationSanitaire   FormationSanitaire @relation(fields: [formationSanitaireId], references: [id], onDelete: Cascade)
+  distanceKm           Float?
+
+  @@id([consultationId, formationSanitaireId])
+  @@map("consultation_orientation")
+}
+
+// ─── RENDEZ-VOUS ─────────────────────────────────────────────
+
+model Creneau {
+  id          String      @id @default(uuid())
+  medecinId   String
+  medecin     Medecin     @relation(fields: [medecinId], references: [id], onDelete: Cascade)
+  jourSemaine JourSemaine
+  heureDebut  String
+  heureFin    String
+  disponible  Boolean     @default(true)
+
+  rendezVous RendezVous[]
+
+  @@index([medecinId, jourSemaine, disponible])
+  @@map("creneau")
+}
+
+model RendezVous {
+  id           String           @id @default(uuid())
+  patientId    String
+  patient      Patient          @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  medecinId    String
+  medecin      Medecin          @relation(fields: [medecinId], references: [id], onDelete: Cascade)
+  creneauId    String?
+  creneau      Creneau?         @relation(fields: [creneauId], references: [id], onDelete: SetNull)
+  dateHeure    DateTime
+  statut       StatutRendezVous @default(EN_ATTENTE)
+  motif        String?          @db.Text
+
+  ordonnances Ordonnance[]
+
+  @@index([medecinId, dateHeure])
+  @@index([patientId, statut])
+  @@map("rendez_vous")
+}
+
+// ─── ORDONNANCES ─────────────────────────────────────────────
+
+/// Ordonnance simplifiée — contenu en texte libre pour la soutenance
+model Ordonnance {
+  id              String   @id @default(uuid())
+  patientId       String
+  patient         Patient  @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  medecinId       String
+  medecin         Medecin  @relation(fields: [medecinId], references: [id], onDelete: Cascade)
+  rendezVousId    String?
+  rendezVous      RendezVous? @relation(fields: [rendezVousId], references: [id], onDelete: SetNull)
+  contenu         String   @db.Text
+  dateEmission    DateTime @default(now())
+  envoyeeWhatsApp Boolean  @default(false)
+  cheminFichier   String?
+
+  @@index([patientId, dateEmission])
+  @@map("ordonnance")
+}
+
+// ─── RAPPELS & NOTIFICATIONS ─────────────────────────────────
+
+model RappelMedicament {
+  id             String   @id @default(uuid())
+  patientId      String
+  patient        Patient  @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  medicament     String
+  heurePrise     String
+  frequence      String
+  actif          Boolean  @default(true)
+  prochaineEnvoi DateTime?
+
+  @@index([actif, prochaineEnvoi])
+  @@map("rappel_medicament")
+}
+
+model Notification {
+  id            String           @id @default(uuid())
+  utilisateurId String
+  utilisateur   Utilisateur      @relation(fields: [utilisateurId], references: [id], onDelete: Cascade)
+  type          TypeNotification
+  titre         String
+  message       String           @db.Text
+  lue           Boolean          @default(false)
+  dateEnvoi     DateTime         @default(now())
+
+  @@index([utilisateurId, lue])
+  @@map("notification")
+}
+
+// ─── SANTÉ PUBLIQUE ──────────────────────────────────────────
+
+model AlerteEpidemiologique {
+  id            String       @id @default(uuid())
+  zone          String
+  pathologieId  String
+  pathologie    Pathologie   @relation(fields: [pathologieId], references: [id], onDelete: Cascade)
+  seuil         Int
+  variationPct  Float
+  dateDetection DateTime     @default(now())
+  statut        StatutAlerte @default(ACTIVE)
+
+  @@index([zone, statut])
+  @@map("alerte_epidemiologique")
+}
+

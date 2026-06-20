@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: smart-sante-api
+    runtime: node
+    buildCommand: npm install && npx prisma generate && npx prisma migrate deploy && npm run build
+    startCommand: npm start
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: smart-sante-db
+          property: connectionString
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        sync: false
+      - key: WHATSAPP_TOKEN
+        sync: false
+      - key: PHONE_NUMBER_ID
+        sync: false
+      - key: WEBHOOK_VERIFY_TOKEN
+        sync: false
+      - key: CLAUDE_API_KEY
+        sync: false
+      - key: BASE_URL
+        sync: false
+
+databases:
+  - name: smart-sante-db
+    databaseName: smartsante
+    user: smartsante
