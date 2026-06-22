@@ -254,3 +254,78 @@ export const connexion = async (req: Request, res: Response) => {
     return res.status(500).json({ message: error.message || 'Erreur serveur.' })
   }
 }
+
+// ── Récupérer le Profil de l'utilisateur connecté ────────────
+export const getProfil = async (req: any, res: Response) => {
+  try {
+    const user = req.user
+    if (!user) {
+      return res.status(401).json({ message: 'Non authentifié.' })
+    }
+
+    // Récupère les informations complémentaires selon le rôle
+    const utilisateur = await prisma.utilisateur.findUnique({
+      where: { id: user.id },
+      include: {
+        patient: true,
+        medecin: {
+          include: {
+            formationSanitaire: true
+          }
+        },
+        administrateur: true
+      }
+    })
+
+    if (!utilisateur) {
+      return res.status(404).json({ message: 'Utilisateur introuvable.' })
+    }
+
+    // Supprime le hash du mot de passe et le code OTP de la réponse
+    const { motDePasseHash, otpCode, otpExpiration, ...cleanUtilisateur } = utilisateur
+
+    return res.status(200).json(cleanUtilisateur)
+  } catch (error: any) {
+    console.error(error)
+    return res.status(500).json({ message: 'Erreur lors de la récupération du profil.' })
+  }
+}
+
+// ── Renvoyer un nouveau code OTP ─────────────────────────────
+export const renvoyerOTP = async (req: Request, res: Response) => {
+  try {
+    const { telephone } = req.body
+    if (!telephone) {
+      return res.status(400).json({ message: 'Numéro de téléphone requis.' })
+    }
+
+    const netTelephone = telephone.replace(/\s+/g, '')
+    const utilisateur = await prisma.utilisateur.findUnique({
+      where: { telephone: netTelephone }
+    })
+
+    if (!utilisateur) {
+      return res.status(404).json({ message: 'Aucun utilisateur avec ce numéro.' })
+    }
+
+    const otpCode = Math.floor(100000 + Math.random() * 900000).toString()
+    const otpExpiration = new Date(Date.now() + 5 * 60 * 1000)
+
+    await prisma.utilisateur.update({
+      where: { id: utilisateur.id },
+      data: { otpCode, otpExpiration }
+    })
+
+    await envoyerOTP(netTelephone, otpCode)
+
+    return res.status(200).json({ message: 'Code OTP renvoyé avec succès.' })
+  } catch (error: any) {
+    console.error(error)
+    return res.status(500).json({ message: 'Erreur lors du renvoi du code OTP.' })
+  }
+}
+
+// ── Déconnexion de l'utilisateur ─────────────────────────────
+export const deconnexion = async (req: Request, res: Response) => {
+  return res.status(200).json({ message: 'Déconnexion réussie.' })
+}
