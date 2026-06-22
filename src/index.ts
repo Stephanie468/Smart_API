@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url'
 
 import authRoutes    from './routes/auth.routes.js'
 import uploadRoutes  from './routes/upload.routes.js'
-import webhookRoutes from './controllers/webhook.routes.js'
+import webhookRoutes from './routes/webhook.routes.js'
 
 dotenv.config()
 
@@ -21,16 +21,19 @@ const __dirname  = path.dirname(__filename)
 app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')))
 
 // ── CORS ─────────────────────────────────────────────────────
+
 app.use(cors({
   origin: [
-    'http://localhost:5173',   // dev frontend
-    'http://localhost:3000',   // dev backend
-    process.env.FRONTEND_URL || '*'  // production
+    'https://smartsante-cameroun.onrender.com',
+    'http://localhost:3000'
   ],
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-}))
+  credentials: true
+}));
 
+// Très important - ajoute cette ligne aussi
+app.options('*', cors());
 // ── Body parser ───────────────────────────────────────────────
 // ⚠️ Le webhook Meta envoie du JSON brut — doit être AVANT les routes
 app.use(express.json())
