@@ -1,39 +1,45 @@
-import { Router, Request, Response } from 'express'
+import { Request, Response } from 'express'
 import { traiterMessageEntrant } from '../services/chatbot.service.js'
 
+// ── Webhook Twilio — réception des messages WhatsApp ─────────
+// Twilio envoie les données en POST avec Content-Type: application/x-www-form-urlencoded
+export const WebhookEntrant = async (req: Request, res: Response) => {
+  try {
+    // Twilio envoie les données dans req.body (urlencoded, pas JSON)
+    const telephone = req.body.From?.replace('whatsapp:', '') // "+237690000000"
+    const texte     = req.body.Body                           // "j'ai de la fièvre"
+    const nomWA     = req.body.ProfileName || 'Patient'
 
-// ── Vérification webhook par Meta ────────────────────────────
-export const GetWebhook = async (req: Request, res: Response) => {
-  const mode      = req.query['hub.mode']
-  const token     = req.query['hub.verify_token']
-  const challenge = req.query['hub.challenge']
+    if (!telephone || !texte) {
+      // Répond à Twilio avec une réponse vide TwiML
+      res.set('Content-Type', 'text/xml')
+      res.send('<Response></Response>')
+      return
+    }
 
-  if (mode === 'subscribe' && token === process.env.WEBHOOK_VERIFY_TOKEN) {
-    console.log('[Webhook] Vérifié par Meta ✅')
-    res.status(200).send(challenge)
-  } else {
-    res.sendStatus(403)
+    console.log(`[Webhook] Message de ${telephone}: ${texte}`)
+
+    // Traitement asynchrone — répond à Twilio immédiatement
+    traiterMessageEntrant(telephone, texte, nomWA).catch(console.error)
+
+    // Twilio attend une réponse TwiML — on renvoie une réponse vide
+    // car on envoie la réponse via l'API Twilio, pas via TwiML
+    res.set('Content-Type', 'text/xml')
+    res.send('<Response></Response>')
+
+  } catch (error) {
+    console.error('[Webhook] Erreur:', error)
+    res.set('Content-Type', 'text/xml')
+    res.send('<Response></Response>')
   }
 }
 
-// ── Réception des messages entrants ─────────────────────────
-export const WebhookEntrant = async (req: Request, res: Response) => {
-  // Répond immédiatement à Meta (obligatoire sous 20 secondes)
-  res.sendStatus(200)
-
-  const body = req.body
-  if (body.object !== 'whatsapp_business_account') return
-
-  const message = body.entry?.[0]?.changes?.[0]?.value?.messages?.[0]
-  const contact = body.entry?.[0]?.changes?.[0]?.value?.contacts?.[0]
-
-  if (!message || message.type !== 'text') return
-
-  const telephone = message.from          // "+237690000000"
-  const texte     = message.text.body     // "j'ai de la fièvre"
-  const nomWA     = contact?.profile?.name || 'Patient'
-
-  // Traitement asynchrone — ne bloque pas Meta
-  traiterMessageEntrant(telephone, texte, nomWA).catch(console.error)
+// ── GET /api/webhook — test de santé ─────────────────────────
+// Twilio n'a pas besoin de vérification GET comme Meta
+// On garde quand même une route GET pour tester que l'endpoint existe
+export const GetWebhook = async (req: Request, res: Response) => {
+  res.json({
+    message: '✅ Webhook Smart-Santé opérationnel',
+    provider: 'Twilio WhatsApp Sandbox'
+  })
 }
-

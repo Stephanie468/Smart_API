@@ -36,9 +36,9 @@ app.use(cors({
 // Très important - ajoute cette ligne aussi
 app.options('*', cors());
 // ── Body parser ───────────────────────────────────────────────
-// ⚠️ Le webhook Meta envoie du JSON brut — doit être AVANT les routes
+// ⚠️ IMPORTANT : Twilio envoie les données en urlencoded, pas en JSON
+app.use(express.urlencoded({ extended: false }))
 app.use(express.json())
-app.use(express.urlencoded({ extended: true }))
 
 // ── Routes ───────────────────────────────────────────────────
 app.use('/api/auth',    authRoutes)     // /api/auth/inscription/patient

@@ -1,36 +1,39 @@
 import prisma from '../config/prisma.js'
-import { envoyerMessage, envoyerFicheDiagnostic, envoyerBienvenue } from './whatsapp.service.js'
+import { envoyerMessage, envoyerBienvenue, envoyerFicheDiagnostic } from './whatsapp.service.js'
 
-const CLAUDE_API_URL = 'https://api.anthropic.com/v1/messages'
-
+// ── Prompt système pour Claude ───────────────────────────────
 const SYSTEM_PROMPT = `Tu es Smart-Santé, un assistant médical bienveillant au Cameroun.
 Tu aides les patients à identifier leurs symptômes en français ou en anglais.
 
-Pathologies que tu couvres : paludisme, typhoïde, infections respiratoires, dermatoses, diarrhées infectieuses, hypertension légère.
+Pathologies que tu connais : paludisme, typhoïde, infections respiratoires, dermatoses, diarrhées infectieuses.
 
-Règles absolues :
-1. Pose UNE seule question courte et claire à la fois
+Règles :
+1. Pose UNE seule question courte à la fois
 2. Après 5 à 7 échanges, génère un résumé avec :
    - Pré-diagnostic probable
    - Niveau d'urgence : VERT (pharmacie), ORANGE (médecin 48h), ROUGE (urgences maintenant)
-   - 2-3 recommandations concrètes
-3. Termine TOUJOURS par : "⚠️ Je ne suis pas un médecin. Consultez un professionnel pour un diagnostic définitif."
-4. Sois chaleureux, concis, et adapte ton langage au contexte camerounais
-5. Si urgence ROUGE : insiste immédiatement sur les soins d'urgence`
+3. Termine TOUJOURS par : "⚠️ Je ne suis pas un médecin. Consultez un professionnel."
+4. Sois chaleureux et concis`
 
 // ── Appel à l'API Claude ─────────────────────────────────────
-async function appellerClaude(historique: Array<{role: string, content: string}>, nouveauMessage: string): Promise<string> {
-  const response = await fetch(CLAUDE_API_URL, {
+async function appellerClaude(
+  historique: Array<{ role: string; content: string }>,
+  nouveauMessage: string
+): Promise<string> {
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
-      'x-api-key': process.env.CLAUDE_API_KEY!,
+      'x-api-key':         process.env.CLAUDE_API_KEY!,
       'anthropic-version': '2023-06-01',
-      'Content-Type': 'application/json',
+      'Content-Type':      'application/json',
     },
     body: JSON.stringify({
-      model: 'claude-haiku-20240307',   // rapide + économique
+      // ✅ Version gratuite — claude-haiku est le modèle le moins cher
+      // Avec 5$ de crédit offert tu peux faire ~500 consultations test
+      model:      'claude-haiku-20240307',
       max_tokens: 400,
-      system: SYSTEM_PROMPT,
+      system:     SYSTEM_PROMPT,
       messages: [
         ...historique,
         { role: 'user', content: nouveauMessage }
@@ -41,6 +44,10 @@ async function appellerClaude(historique: Array<{role: string, content: string}>
   if (!response.ok) {
     const err = await response.json()
     console.error('[Claude] Erreur:', err)
+    // Si le crédit est épuisé → message de secours
+    if (err.error?.type === 'invalid_request_error') {
+      return "Je rencontre une difficulté technique. Veuillez réessayer dans quelques instants. 🏥"
+    }
     throw new Error('Erreur API Claude')
   }
 
@@ -54,6 +61,7 @@ export async function traiterMessageEntrant(
   texte: string,
   nomWA: string
 ): Promise<void> {
+
   // 1. Trouve ou crée le patient
   let utilisateur = await prisma.utilisateur.findUnique({
     where: { telephone },
@@ -61,22 +69,19 @@ export async function traiterMessageEntrant(
   })
 
   if (!utilisateur) {
-    // Nouveau patient — crée automatiquement un profil minimal
+    // Nouveau patient → crée son profil automatiquement
     utilisateur = await prisma.utilisateur.create({
       data: {
-        nom: nomWA.split(' ')[0] || 'Patient',
-        prenom: nomWA.split(' ')[1] || '',
+        nom:      nomWA.split(' ')[0] || 'Patient',
+        prenom:   nomWA.split(' ').slice(1).join(' ') || '',
         telephone,
-        role: 'PATIENT',
-        statut: 'ACTIF',
-        patient: {
-          create: { langue: 'FR' }
-        }
+        role:     'PATIENT',
+        statut:   'ACTIF',
+        patient:  { create: { langue: 'FR' } }
       },
       include: { patient: true }
     })
 
-    // Message de bienvenue pour les nouveaux
     await envoyerBienvenue(telephone, nomWA)
     return
   }
@@ -85,11 +90,7 @@ export async function traiterMessageEntrant(
 
   // 2. Récupère ou crée la conversation active
   let conversation = await prisma.conversation.findFirst({
-    where: {
-      patientId,
-      statut: 'EN_COURS',
-      canal: 'WHATSAPP'
-    },
+    where: { patientId, statut: 'EN_COURS', canal: 'WHATSAPP' },
     include: { messages: { orderBy: { horodatage: 'asc' } } }
   })
 
@@ -102,7 +103,7 @@ export async function traiterMessageEntrant(
 
   // 3. Construit l'historique pour Claude
   const historique = conversation.messages.map(m => ({
-    role: m.expediteur === 'PATIENT' ? 'user' : 'assistant',
+    role:    m.expediteur === 'PATIENT' ? 'user' : 'assistant',
     content: m.contenu
   }))
 
@@ -110,42 +111,42 @@ export async function traiterMessageEntrant(
   await prisma.message.create({
     data: {
       conversationId: conversation.id,
-      contenu: texte,
-      expediteur: 'PATIENT'
+      contenu:        texte,
+      expediteur:     'PATIENT'
     }
   })
 
   // 5. Appelle Claude
   const reponseIA = await appellerClaude(historique, texte)
 
-  // 6. Sauvegarde la réponse de l'IA
+  // 6. Sauvegarde la réponse
   await prisma.message.create({
     data: {
       conversationId: conversation.id,
-      contenu: reponseIA,
-      expediteur: 'IA'
+      contenu:        reponseIA,
+      expediteur:     'IA'
     }
   })
 
   // 7. Détecte si c'est un diagnostic final
-  const estDiagnosticFinal = reponseIA.includes('VERT') ||
-                              reponseIA.includes('ORANGE') ||
-                              reponseIA.includes('ROUGE')
+  const estFinal =
+    reponseIA.includes('VERT') ||
+    reponseIA.includes('ORANGE') ||
+    reponseIA.includes('ROUGE')
 
-  if (estDiagnosticFinal) {
-    // Détermine le niveau d'urgence
+  if (estFinal) {
     const urgence = reponseIA.includes('ROUGE') ? 'ROUGE'
                   : reponseIA.includes('ORANGE') ? 'ORANGE'
                   : 'VERT'
 
-    // Sauvegarde la consultation IA en base
+    // Sauvegarde la consultation en base
     await prisma.consultationIA.create({
       data: {
         patientId,
-        conversationId: conversation.id,
-        symptomes: historique.filter(m => m.role === 'user').map(m => m.content).join(' | '),
-        preDiagnostic: reponseIA,
-        niveauUrgence: urgence,
+        conversationId:  conversation.id,
+        symptomes:       historique.filter(m => m.role === 'user').map(m => m.content).join(' | '),
+        preDiagnostic:   reponseIA,
+        niveauUrgence:   urgence,
         suiviDateRelance: new Date(Date.now() + 48 * 60 * 60 * 1000)
       }
     })
@@ -153,16 +154,10 @@ export async function traiterMessageEntrant(
     // Ferme la conversation
     await prisma.conversation.update({
       where: { id: conversation.id },
-      data: { statut: 'TERMINEE', dateFin: new Date() }
+      data:  { statut: 'TERMINEE', dateFin: new Date() }
     })
   }
 
-  // 8. Envoie la réponse au patient
+  // 8. Envoie la réponse au patient via Twilio
   await envoyerMessage(telephone, reponseIA)
-}
-
-// Helper pour envoyerMessage depuis whatsapp.service
-async function envoyerMessages(telephone: string, message: string): Promise<void> {
-  const { envoyerMessage: send } = await import('./whatsapp.service.js')
-  await send(telephone, message)
 }
