@@ -1,5 +1,5 @@
 import prisma from '../config/prisma.js'
-import { envoyerMessage, envoyerBienvenue, envoyerFicheDiagnostic } from './whatsapp.service.js'
+import { envoyerMessage, envoyerFicheDiagnostic } from './whatsapp.service.js'
 
 // ── Prompt système pour Claude ───────────────────────────────
 const SYSTEM_PROMPT = `Tu es Smart-Santé, un assistant médical bienveillant au Cameroun.
@@ -68,23 +68,62 @@ export async function traiterMessageEntrant(
     include: { patient: true }
   })
 
-  if (!utilisateur) {
-    // Nouveau patient → crée son profil automatiquement
-    utilisateur = await prisma.utilisateur.create({
-      data: {
-        nom:      nomWA.split(' ')[0] || 'Patient',
-        prenom:   nomWA.split(' ').slice(1).join(' ') || '',
-        telephone,
-        role:     'PATIENT',
-        statut:   'ACTIF',
-        patient:  { create: { langue: 'FR' } }
-      },
-      include: { patient: true }
-    })
+  
+if (!utilisateur) {
+  utilisateur = await prisma.utilisateur.create({
+    data: {
+      nom:      nomWA.split(' ')[0] || 'Patient',
+      prenom:   nomWA.split(' ').slice(1).join(' ') || '',
+      telephone,
+      role:     'PATIENT',
+      statut:   'ACTIF',
+      patient:  { create: { langue: 'FR' } }
+    },
+    include: { patient: true }
+  })
 
-    await envoyerBienvenue(telephone, nomWA)
-    return
-  }
+  // Message de bienvenue + première question d'onboarding
+  await envoyerMessage(telephone,
+    `👋 Bonjour *${nomWA}* ! Bienvenue sur *Smart-Santé Cameroun* 🏥\n\n` +
+    `Je suis votre assistant médical IA.\n\n` +
+    `Avant de commencer, puis-je connaître votre *ville de résidence* ?\n` +
+    `_(Ex: Douala, Yaoundé, Bafoussam...)_`
+  )
+  return
+}
+
+// Gestion de l'onboarding progressif
+const patient = utilisateur.patient!
+
+// Si la ville n'est pas encore renseignée → collecte la ville
+if (!patient.ville) {
+  await prisma.patient.update({
+    where: { id: patient.id },
+    data: { ville: texte.trim(), localisation: texte.trim() }
+  })
+  await envoyerMessage(telephone,
+    `✅ Noté ! Vous êtes à *${texte.trim()}*.\n\n` +
+    `Quel est votre *âge* approximatif ?\n_(Ex: 25 ans)_`
+  )
+  return
+}
+
+// Si pas d'antécédents → collecte l'âge/antécédents
+if (!patient.antecedents) {
+  await prisma.patient.update({
+    where: { id: patient.id },
+    data: { antecedents: `Âge déclaré : ${texte.trim()}` }
+  })
+  await envoyerMessage(telephone,
+    `✅ Parfait !\n\n` +
+    `Votre profil est maintenant complet. 🎉\n\n` +
+    `Vous pouvez maintenant *décrire vos symptômes* et je vous aiderai à comprendre votre état de santé.\n\n` +
+    `_Exemple : "j'ai de la fièvre depuis 2 jours et des maux de tête"_`
+  )
+  return
+}
+
+
 
   const patientId = utilisateur.patient!.id
 

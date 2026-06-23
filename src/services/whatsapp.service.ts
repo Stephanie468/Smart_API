@@ -37,11 +37,6 @@ export async function envoyerOTP(telephone: string, code: string): Promise<void>
   await envoyerMessage(telephone, message)
 }
 
-// ── Message de bienvenue nouveau patient ─────────────────────
-export async function envoyerBienvenue(telephone: string, nom: string): Promise<void> {
-  const message = `👋 Bonjour *${nom}* !\n\nBienvenue sur *Smart-Santé Cameroun*. 🏥\n\nJe suis votre assistant médical IA. Décrivez vos symptômes et je vous aide.\n\n_Exemple : "j'ai de la fièvre depuis 2 jours"_`
-  await envoyerMessage(telephone, message)
-}
 
 // ── Envoi du résumé de diagnostic ────────────────────────────
 export async function envoyerFicheDiagnostic(
