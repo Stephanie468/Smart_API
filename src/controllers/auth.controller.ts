@@ -11,56 +11,63 @@ function genererOTP(): string {
 }
 
 // ── Inscription Patient ──────────────────────────────────────
-export const inscrirePatient = async (req: Request, res: Response)  => {
+export const inscrirePatient = async (req: Request, res: Response) => {
   try {
     const { nom, prenom, telephone, dateNaissance, ville } = req.body
 
     // Validation
-    if (!nom || nom.trim().length < 2)
+    if (!nom?.trim() || nom.trim().length < 2)
       return res.status(400).json({ message: 'Nom complet requis.' })
     if (!telephone || !/^\+?\d{8,15}$/.test(telephone.replace(/\s+/g, '')))
       return res.status(400).json({ message: 'Numéro WhatsApp invalide.' })
-    if (!dateNaissance)
-      return res.status(400).json({ message: 'Date de naissance requise.' })
 
-    const otpCode = genererOTP()
-    const otpExpiration = new Date(Date.now() + 5 * 60 * 1000) // 5 minutes
+    const telPropre = telephone.replace(/\s+/g, '')
 
-    const netTelephone = telephone.replace(/\s+/g, '')
+    // Vérifie si le numéro existe déjà
+    const existant = await prisma.utilisateur.findUnique({
+      where: { telephone: telPropre }
+    })
+    if (existant)
+      return res.status(409).json({ message: 'Ce numéro est déjà enregistré.' })
 
-    // Crée l'utilisateur + profil patient dans une transaction
+    const otpCode      = genererOTP()
+    const otpExpiration = new Date(Date.now() + 5 * 60 * 1000)
+
     const utilisateur = await prisma.utilisateur.create({
       data: {
-        nom: nom.trim(),
+        nom:    nom.trim(),
         prenom: prenom?.trim() || '',
-        telephone: netTelephone,
-        role: 'PATIENT',
+        telephone: telPropre,
+        role:   'PATIENT',
+        // ✅ INACTIF jusqu'à vérification OTP
+        statut: 'INACTIF',
         otpCode,
         otpExpiration,
         patient: {
           create: {
-            ville,
-            localisation: ville,
-            langue: 'FR'
+            ville:       ville || null,
+            localisation: ville || null,
+            langue:      'FR'
           }
         }
       }
     })
 
-     await envoyerOTP( telephone, otpCode)
+    // ✅ Envoie l'OTP via Twilio
+    await envoyerOTP(telPropre, otpCode)
 
     return res.status(201).json({
       message: 'Compte créé. Code OTP envoyé sur WhatsApp.',
       utilisateurId: utilisateur.id
     })
+
   } catch (error: any) {
     if (error.code === 'P2002')
       return res.status(409).json({ message: 'Ce numéro est déjà enregistré.' })
-    console.error(error)
-    return res.status(500).json({ message: 'Erreur serveur. Réessayez.' })
+    console.error('[InscrirePatient] Erreur:', error)
+    return res.status(500).json({ message: 'Erreur serveur.' })
   }
 }
-
 // ── Inscription Médecin ──────────────────────────────────────
 export const inscrireMedecin = async (req: Request, res: Response) => {
   try {
@@ -138,16 +145,22 @@ export const verifierOTP = async (req: Request, res: Response) => {
     })
 
     if (!utilisateur)
-      return res.status(400).json({ message: 'Aucun compte trouvé pour ce numéro.' })
+      return res.status(404).json({ message: 'Aucun compte trouvé.' })
+
     if (utilisateur.otpCode !== code)
       return res.status(400).json({ message: 'Code incorrect.' })
+
     if (!utilisateur.otpExpiration || utilisateur.otpExpiration < new Date())
       return res.status(400).json({ message: 'Code expiré. Demandez un nouveau code.' })
 
-    // Invalide le code après utilisation
+    // ✅ Invalide le code ET active le compte
     await prisma.utilisateur.update({
       where: { telephone },
-      data: { otpCode: null, otpExpiration: null, statut: 'ACTIF' }
+      data: {
+        otpCode:       null,
+        otpExpiration: null,
+        statut:        'ACTIF'   // ← active le compte après vérification
+      }
     })
 
     const token = jwt.sign(
@@ -160,18 +173,19 @@ export const verifierOTP = async (req: Request, res: Response) => {
       message: 'Compte vérifié avec succès.',
       token,
       utilisateur: {
-        id: utilisateur.id,
-        nom: utilisateur.nom,
-        prenom: utilisateur.prenom,
+        id:        utilisateur.id,
+        nom:       utilisateur.nom,
+        prenom:    utilisateur.prenom,
         telephone: utilisateur.telephone,
-        role: utilisateur.role
+        role:      utilisateur.role
       }
     })
+
   } catch (error: any) {
-    return res.status(400).json({ message: error.message || 'Code invalide ou expiré.' })
+    console.error('[VerifierOTP] Erreur:', error)
+    return res.status(400).json({ message: error.message || 'Code invalide.' })
   }
 }
-
 // ── Connexion ─────────────────────────────────────────────────
 export const connexion = async (req: Request, res: Response) => {
   try {
@@ -185,17 +199,50 @@ export const connexion = async (req: Request, res: Response) => {
     if (!utilisateur)
       return res.status(401).json({ message: 'Aucun compte trouvé.' })
 
-    // ── Patient → OTP uniquement ─────────────────────────────
+    // ── Patient → mot de passe si disponible, sinon OTP ───
     if (utilisateur.role === 'PATIENT') {
+      if (motDePasse) {
+        if (!utilisateur.motDePasseHash) {
+          return res.status(401).json({ message: 'Mot de passe invalide ou compte non configuré pour la connexion par mot de passe.' })
+        }
+
+        const valide = await bcrypt.compare(motDePasse, utilisateur.motDePasseHash)
+        if (!valide) {
+          return res.status(401).json({ message: 'Mot de passe incorrect.' })
+        }
+
+        const token = jwt.sign(
+          { id: utilisateur.id, role: utilisateur.role },
+          process.env.JWT_SECRET as string,
+          { expiresIn: '7d' }
+        )
+
+        return res.status(200).json({
+          message: 'Connexion réussie.',
+          token,
+          utilisateur: {
+            id: utilisateur.id,
+            nom: utilisateur.nom,
+            prenom: utilisateur.prenom,
+            telephone: utilisateur.telephone,
+            role: utilisateur.role
+          }
+        })
+      }
+
       const otpCode = genererOTP()
       const otpExpiration = new Date(Date.now() + 5 * 60 * 1000)
 
       await prisma.utilisateur.update({
         where: { id: utilisateur.id },
-        data: { otpCode, otpExpiration }
+        data: {
+          otpCode,
+          otpExpiration,
+          statut: 'ACTIF'
+        }
       })
 
-      await envoyerOTP( telephone, otpCode)
+      await envoyerOTP(utilisateur.telephone!, otpCode)
 
       return res.status(200).json({
         message: 'OTP_SENT',
@@ -204,11 +251,10 @@ export const connexion = async (req: Request, res: Response) => {
       })
     }
 
-    // ── Médecin → vérifie le statut de certification ─────────
+    // ── Médecin → vérifie le statut de certification ──────
     if (utilisateur.role === 'MEDECIN') {
       const medecin = utilisateur.medecin
 
-      // Compte en attente → redirige vers page d'attente
       if (medecin?.statutCertification === 'EN_ATTENTE') {
         return res.status(403).json({
           message: 'COMPTE_EN_ATTENTE',
@@ -216,11 +262,8 @@ export const connexion = async (req: Request, res: Response) => {
         })
       }
 
-      // Compte suspendu ou rejeté
-      if (
-        medecin?.statutCertification === 'SUSPENDU' ||
-        medecin?.statutCertification === 'REJETE'
-      ) {
+      if (medecin?.statutCertification === 'SUSPENDU' ||
+          medecin?.statutCertification === 'REJETE') {
         return res.status(403).json({
           message: 'COMPTE_SUSPENDU',
           details: 'Votre accès a été suspendu. Contactez support@smartsante.cm'
@@ -228,8 +271,20 @@ export const connexion = async (req: Request, res: Response) => {
       }
     }
 
-    // ── Vérification mot de passe (Médecin + Admin) ──────────
-    const valide = await bcrypt.compare(motDePasse, utilisateur.motDePasseHash || '')
+    // ── Médecin + Admin → vérification mot de passe ───────
+    // ✅ CORRECTION : vérifie que motDePasseHash existe avant bcrypt
+    if (!utilisateur.motDePasseHash) {
+      return res.status(401).json({
+        message: 'Ce compte ne supporte pas la connexion par mot de passe.'
+      })
+    }
+
+    if (!motDePasse) {
+      return res.status(400).json({ message: 'Mot de passe requis.' })
+    }
+
+    const valide = await bcrypt.compare(motDePasse, utilisateur.motDePasseHash)
+
     if (!valide)
       return res.status(401).json({ message: 'Mot de passe incorrect.' })
 
@@ -243,14 +298,16 @@ export const connexion = async (req: Request, res: Response) => {
       message: 'Connexion réussie.',
       token,
       utilisateur: {
-        id: utilisateur.id,
-        nom: utilisateur.nom,
+        id:     utilisateur.id,
+        nom:    utilisateur.nom,
         prenom: utilisateur.prenom,
-        email: utilisateur.email,
-        role: utilisateur.role
+        email:  utilisateur.email,
+        role:   utilisateur.role
       }
     })
+
   } catch (error: any) {
+    console.error('[Connexion] Erreur:', error)
     return res.status(500).json({ message: error.message || 'Erreur serveur.' })
   }
 }
