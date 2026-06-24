@@ -1,7 +1,7 @@
 import prisma from '../config/prisma.js'
-import { envoyerMessage, envoyerFicheDiagnostic } from './whatsapp.service.js'
+import { envoyerMessage } from './whatsapp.service.js'
 
-// ── Prompt système pour Claude ───────────────────────────────
+// ── Prompt système pour Gemini ───────────────────────────────
 const SYSTEM_PROMPT = `Tu es Smart-Santé, un assistant médical bienveillant au Cameroun.
 Tu aides les patients à identifier leurs symptômes en français ou en anglais.
 
@@ -15,44 +15,46 @@ Règles :
 3. Termine TOUJOURS par : "⚠️ Je ne suis pas un médecin. Consultez un professionnel."
 4. Sois chaleureux et concis`
 
-// ── Appel à l'API Claude ─────────────────────────────────────
-async function appellerClaude(
+// ── Appel à l'API Gemini ─────────────────────────────────────
+async function appellerGemini(
   historique: Array<{ role: string; content: string }>,
   nouveauMessage: string
 ): Promise<string> {
 
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key':         process.env.CLAUDE_API_KEY!,
-      'anthropic-version': '2023-06-01',
-      'Content-Type':      'application/json',
-    },
-    body: JSON.stringify({
-      // ✅ Version gratuite — claude-haiku est le modèle le moins cher
-      // Avec 5$ de crédit offert tu peux faire ~500 consultations test
-      model:      'claude-haiku-20240307',
-      max_tokens: 400,
-      system:     SYSTEM_PROMPT,
-      messages: [
-        ...historique,
-        { role: 'user', content: nouveauMessage }
-      ]
-    })
-  })
+  // Construit l'historique au format Gemini
+  const contents = [
+    ...historique.map(m => ({
+      role: m.role === 'user' ? 'user' : 'model',
+      parts: [{ text: m.content }]
+    })),
+    {
+      role: 'user',
+      parts: [{ text: nouveauMessage }]
+    }
+  ]
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        systemInstruction: {
+          parts: [{ text: SYSTEM_PROMPT }]
+        },
+        contents
+      })
+    }
+  )
 
   if (!response.ok) {
     const err = await response.json()
-    console.error('[Claude] Erreur:', err)
-    // Si le crédit est épuisé → message de secours
-    if (err.error?.type === 'invalid_request_error') {
-      return "Je rencontre une difficulté technique. Veuillez réessayer dans quelques instants. 🏥"
-    }
-    throw new Error('Erreur API Claude')
+    console.error('[Gemini] Erreur:', err)
+    return "Je rencontre une difficulté technique. Veuillez réessayer dans quelques instants. 🏥"
   }
 
   const data = await response.json()
-  return data.content[0].text
+  return data.candidates[0].content.parts[0].text
 }
 
 // ── Traitement principal du message WhatsApp ─────────────────
@@ -68,62 +70,56 @@ export async function traiterMessageEntrant(
     include: { patient: true }
   })
 
-  
-if (!utilisateur) {
-  utilisateur = await prisma.utilisateur.create({
-    data: {
-      nom:      nomWA.split(' ')[0] || 'Patient',
-      prenom:   nomWA.split(' ').slice(1).join(' ') || '',
-      telephone,
-      role:     'PATIENT',
-      statut:   'ACTIF',
-      patient:  { create: { langue: 'FR' } }
-    },
-    include: { patient: true }
-  })
+  if (!utilisateur) {
+    utilisateur = await prisma.utilisateur.create({
+      data: {
+        nom:      nomWA.split(' ')[0] || 'Patient',
+        prenom:   nomWA.split(' ').slice(1).join(' ') || '',
+        telephone,
+        role:     'PATIENT',
+        statut:   'ACTIF',
+        patient:  { create: { langue: 'FR' } }
+      },
+      include: { patient: true }
+    })
 
-  // Message de bienvenue + première question d'onboarding
-  await envoyerMessage(telephone,
-    `👋 Bonjour *${nomWA}* ! Bienvenue sur *Smart-Santé Cameroun* 🏥\n\n` +
-    `Je suis votre assistant médical IA.\n\n` +
-    `Avant de commencer, puis-je connaître votre *ville de résidence* ?\n` +
-    `_(Ex: Douala, Yaoundé, Bafoussam...)_`
-  )
-  return
-}
+    await envoyerMessage(telephone,
+      `👋 Bonjour *${nomWA}* ! Bienvenue sur *Smart-Santé Cameroun* 🏥\n\n` +
+      `Je suis votre assistant médical IA.\n\n` +
+      `Avant de commencer, puis-je connaître votre *ville de résidence* ?\n` +
+      `_(Ex: Douala, Yaoundé, Bafoussam...)_`
+    )
+    return
+  }
 
-// Gestion de l'onboarding progressif
-const patient = utilisateur.patient!
+  // Gestion de l'onboarding progressif
+  const patient = utilisateur.patient!
 
-// Si la ville n'est pas encore renseignée → collecte la ville
-if (!patient.ville) {
-  await prisma.patient.update({
-    where: { id: patient.id },
-    data: { ville: texte.trim(), localisation: texte.trim() }
-  })
-  await envoyerMessage(telephone,
-    `✅ Noté ! Vous êtes à *${texte.trim()}*.\n\n` +
-    `Quel est votre *âge* approximatif ?\n_(Ex: 25 ans)_`
-  )
-  return
-}
+  if (!patient.ville) {
+    await prisma.patient.update({
+      where: { id: patient.id },
+      data: { ville: texte.trim(), localisation: texte.trim() }
+    })
+    await envoyerMessage(telephone,
+      `✅ Noté ! Vous êtes à *${texte.trim()}*.\n\n` +
+      `Quel est votre *âge* approximatif ?\n_(Ex: 25 ans)_`
+    )
+    return
+  }
 
-// Si pas d'antécédents → collecte l'âge/antécédents
-if (!patient.antecedents) {
-  await prisma.patient.update({
-    where: { id: patient.id },
-    data: { antecedents: `Âge déclaré : ${texte.trim()}` }
-  })
-  await envoyerMessage(telephone,
-    `✅ Parfait !\n\n` +
-    `Votre profil est maintenant complet. 🎉\n\n` +
-    `Vous pouvez maintenant *décrire vos symptômes* et je vous aiderai à comprendre votre état de santé.\n\n` +
-    `_Exemple : "j'ai de la fièvre depuis 2 jours et des maux de tête"_`
-  )
-  return
-}
-
-
+  if (!patient.antecedents) {
+    await prisma.patient.update({
+      where: { id: patient.id },
+      data: { antecedents: `Âge déclaré : ${texte.trim()}` }
+    })
+    await envoyerMessage(telephone,
+      `✅ Parfait !\n\n` +
+      `Votre profil est maintenant complet. 🎉\n\n` +
+      `Vous pouvez maintenant *décrire vos symptômes* et je vous aiderai à comprendre votre état de santé.\n\n` +
+      `_Exemple : "j'ai de la fièvre depuis 2 jours et des maux de tête"_`
+    )
+    return
+  }
 
   const patientId = utilisateur.patient!.id
 
@@ -140,9 +136,9 @@ if (!patient.antecedents) {
     })
   }
 
-  // 3. Construit l'historique pour Claude
+  // 3. Construit l'historique pour Gemini
   const historique = conversation.messages.map(m => ({
-    role:    m.expediteur === 'PATIENT' ? 'user' : 'assistant',
+    role:    m.expediteur === 'PATIENT' ? 'user' : 'model',
     content: m.contenu
   }))
 
@@ -155,8 +151,8 @@ if (!patient.antecedents) {
     }
   })
 
-  // 5. Appelle Claude
-  const reponseIA = await appellerClaude(historique, texte)
+  // 5. Appelle Gemini
+  const reponseIA = await appellerGemini(historique, texte)
 
   // 6. Sauvegarde la réponse
   await prisma.message.create({
@@ -178,25 +174,23 @@ if (!patient.antecedents) {
                   : reponseIA.includes('ORANGE') ? 'ORANGE'
                   : 'VERT'
 
-    // Sauvegarde la consultation en base
     await prisma.consultationIA.create({
       data: {
         patientId,
-        conversationId:  conversation.id,
-        symptomes:       historique.filter(m => m.role === 'user').map(m => m.content).join(' | '),
-        preDiagnostic:   reponseIA,
-        niveauUrgence:   urgence,
+        conversationId:   conversation.id,
+        symptomes:        historique.filter(m => m.role === 'user').map(m => m.content).join(' | '),
+        preDiagnostic:    reponseIA,
+        niveauUrgence:    urgence,
         suiviDateRelance: new Date(Date.now() + 48 * 60 * 60 * 1000)
       }
     })
 
-    // Ferme la conversation
     await prisma.conversation.update({
       where: { id: conversation.id },
       data:  { statut: 'TERMINEE', dateFin: new Date() }
     })
   }
 
-  // 8. Envoie la réponse au patient via Twilio
+  // 8. Envoie la réponse au patient
   await envoyerMessage(telephone, reponseIA)
 }
