@@ -386,3 +386,202 @@ export const renvoyerOTP = async (req: Request, res: Response) => {
 export const deconnexion = async (req: Request, res: Response) => {
   return res.status(200).json({ message: 'Déconnexion réussie.' })
 }
+
+// ── Mot de passe oublié Patient (OTP WhatsApp) ───────────────
+export const motDePasseOubliePatient = async (req: Request, res: Response) => {
+  try {
+    const { telephone } = req.body
+    if (!telephone)
+      return res.status(400).json({ message: 'Numéro WhatsApp requis.' })
+
+    const tel = telephone.replace(/\s+/g, '')
+    const utilisateur = await prisma.utilisateur.findUnique({
+      where: { telephone: tel }
+    })
+
+    if (!utilisateur || utilisateur.role !== 'PATIENT')
+      return res.status(404).json({ message: 'Aucun compte patient trouvé.' })
+
+    const otpCode = genererOTP()
+    const otpExpiration = new Date(Date.now() + 10 * 60 * 1000) // 10 min
+
+    await prisma.utilisateur.update({
+      where: { id: utilisateur.id },
+      data: { otpCode, otpExpiration }
+    })
+
+    await envoyerOTP(tel, otpCode)
+
+    return res.status(200).json({
+      message: 'CODE_ENVOYE',
+      telephone: tel
+    })
+  } catch (error: any) {
+    console.error('[MotDePasseOubliePatient]', error)
+    return res.status(500).json({ message: 'Erreur serveur.' })
+  }
+}
+
+// ── Mot de passe oublié Médecin (OTP Email) ──────────────────
+export const motDePasseOublieMedecin = async (req: Request, res: Response) => {
+  try {
+    const { email } = req.body
+    if (!email)
+      return res.status(400).json({ message: 'Email requis.' })
+
+    const utilisateur = await prisma.utilisateur.findUnique({
+      where: { email: email.toLowerCase().trim() }
+    })
+
+    if (!utilisateur || utilisateur.role !== 'MEDECIN')
+      return res.status(404).json({ message: 'Aucun compte médecin trouvé.' })
+
+    const otpCode = genererOTP()
+    const otpExpiration = new Date(Date.now() + 10 * 60 * 1000)
+
+    await prisma.utilisateur.update({
+      where: { id: utilisateur.id },
+      data: { otpCode, otpExpiration }
+    })
+
+    // TODO: Envoyer par email (Nodemailer)
+    // Pour l'instant, on log en dev
+    console.log(`[OTP Email] ${email} → ${otpCode}`)
+
+    return res.status(200).json({
+      message: 'CODE_ENVOYE',
+      email: utilisateur.email
+    })
+  } catch (error: any) {
+    console.error('[MotDePasseOublieMedecin]', error)
+    return res.status(500).json({ message: 'Erreur serveur.' })
+  }
+}
+
+// ── Vérifier OTP réinitialisation ────────────────────────────
+export const verifierOTPReset = async (req: Request, res: Response) => {
+  try {
+    const { telephone, email, code } = req.body
+
+    const utilisateur = await prisma.utilisateur.findFirst({
+      where: telephone ? { telephone } : { email }
+    })
+
+    if (!utilisateur)
+      return res.status(404).json({ message: 'Compte introuvable.' })
+    if (utilisateur.otpCode !== code)
+      return res.status(400).json({ message: 'Code incorrect.' })
+    if (!utilisateur.otpExpiration || utilisateur.otpExpiration < new Date())
+      return res.status(400).json({ message: 'Code expiré. Recommencez.' })
+
+    // Token temporaire pour autoriser le changement de mot de passe
+    const tokenReset = jwt.sign(
+      { id: utilisateur.id, role: utilisateur.role, type: 'reset' },
+      process.env.JWT_SECRET as string,
+      { expiresIn: '15m' }
+    )
+
+    // Invalide l'OTP
+    await prisma.utilisateur.update({
+      where: { id: utilisateur.id },
+      data: { otpCode: null, otpExpiration: null }
+    })
+
+    return res.status(200).json({
+      message: 'CODE_VALIDE',
+      tokenReset
+    })
+  } catch (error: any) {
+    return res.status(500).json({ message: 'Erreur serveur.' })
+  }
+}
+
+// ── Nouveau mot de passe ──────────────────────────────────────
+export const reinitialiserMotDePasse = async (req: Request, res: Response) => {
+  try {
+    const { tokenReset, nouveauMotDePasse } = req.body
+
+    if (!tokenReset || !nouveauMotDePasse)
+      return res.status(400).json({ message: 'Token et nouveau mot de passe requis.' })
+    if (nouveauMotDePasse.length < 8)
+      return res.status(400).json({ message: 'Mot de passe trop court (8 caractères minimum).' })
+
+    // Vérifie le token temporaire
+    let payload: any
+    try {
+      payload = jwt.verify(tokenReset, process.env.JWT_SECRET as string)
+    } catch {
+      return res.status(401).json({ message: 'Lien expiré. Recommencez.' })
+    }
+
+    if (payload.type !== 'reset')
+      return res.status(401).json({ message: 'Token invalide.' })
+
+    const hash = await bcrypt.hash(nouveauMotDePasse, 12)
+
+    await prisma.utilisateur.update({
+      where: { id: payload.id },
+      data: { motDePasseHash: hash, statut: 'ACTIF' }
+    })
+
+    // Génère un vrai token de connexion
+    const token = jwt.sign(
+      { id: payload.id, role: payload.role },
+      process.env.JWT_SECRET as string,
+      { expiresIn: '7d' }
+    )
+
+    const utilisateur = await prisma.utilisateur.findUnique({
+      where: { id: payload.id }
+    })
+
+    return res.status(200).json({
+      message: 'Mot de passe mis à jour avec succès.',
+      token,
+      utilisateur: {
+        id:     payload.id,
+        nom:    utilisateur?.nom,
+        prenom: utilisateur?.prenom,
+        role:   payload.role
+      }
+    })
+  } catch (error: any) {
+    return res.status(500).json({ message: 'Erreur serveur.' })
+  }
+}
+
+// ── Modifier mot de passe (connecté) ─────────────────────────
+export const modifierMotDePasse = async (req: any, res: Response) => {
+  try {
+    const { ancienMotDePasse, nouveauMotDePasse } = req.body
+    const userId = req.user?.id
+
+    if (!userId)
+      return res.status(401).json({ message: 'Non authentifié.' })
+    if (!ancienMotDePasse || !nouveauMotDePasse)
+      return res.status(400).json({ message: 'Tous les champs sont requis.' })
+    if (nouveauMotDePasse.length < 8)
+      return res.status(400).json({ message: 'Nouveau mot de passe trop court.' })
+
+    const utilisateur = await prisma.utilisateur.findUnique({
+      where: { id: userId }
+    })
+
+    if (!utilisateur?.motDePasseHash)
+      return res.status(400).json({ message: 'Aucun mot de passe défini.' })
+
+    const valide = await bcrypt.compare(ancienMotDePasse, utilisateur.motDePasseHash)
+    if (!valide)
+      return res.status(401).json({ message: 'Mot de passe actuel incorrect.' })
+
+    const hash = await bcrypt.hash(nouveauMotDePasse, 12)
+    await prisma.utilisateur.update({
+      where: { id: userId },
+      data: { motDePasseHash: hash }
+    })
+
+    return res.status(200).json({ message: 'Mot de passe modifié avec succès.' })
+  } catch (error: any) {
+    return res.status(500).json({ message: 'Erreur serveur.' })
+  }
+}
