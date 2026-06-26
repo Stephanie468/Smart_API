@@ -21,61 +21,63 @@ async function appellerGroq(
   nouveauMessage: string
 ): Promise<string> {
 
-  // 1. Sécurité : Vérifier la clé API
-  const apiKey = process.env.GROQ_API_KEY;
+  const apiKey = process.env.GROQ_API_KEY
   if (!apiKey) {
-    console.error("[Groq] Erreur : La variable d'environnement GROQ_API_KEY n'est pas définie.");
-    return "Configuration manquante. Veuillez vérifier les variables d'environnement.";
+    console.error("[Groq] GROQ_API_KEY manquante")
+    return "Configuration manquante. Contactez l'administrateur."
   }
 
-  // 2. Structurer les messages au format standard requis par Groq
+  // ✅ Messages bien formatés — role doit être 'user' ou 'assistant' uniquement
   const messages = [
     { role: 'system', content: SYSTEM_PROMPT },
     ...historique.map(m => ({
-      // Groq utilise 'assistant' au lieu de 'model'
-      role: m.role === 'user' ? 'user' : 'assistant', 
+      role:    m.role === 'user' ? 'user' : 'assistant',
       content: m.content
     })),
     { role: 'user', content: nouveauMessage }
-  ];
+  ]
 
   try {
-    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
-      headers: { 
+      headers: {
         'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json' 
+        'Content-Type':  'application/json'
       },
       body: JSON.stringify({
-        model: "openai/gpt-oss-20b", // Modèle Llama 3 optimisé pour la vitesse et gratuit
-        messages: messages,
-        temperature: 0.5 // Légèrement abaissé pour des réponses médicales plus stables
+        // ✅ Modèles Groq gratuits disponibles en 2026
+        // llama-3.3-70b-versatile → meilleur pour le médical
+        // llama-3.1-8b-instant    → plus rapide mais moins précis
+        model:       'llama-3.3-70b-versatile',
+        messages,
+        temperature: 0.4,
+        max_tokens:  500,
+        // ✅ IMPORTANT : désactive explicitement les tools
+        // C'est ce qui causait l'erreur "tool choice is none but model called a tool"
+        tool_choice: 'none',
       })
-    });  
+    })
 
-    // 3. Gestion des erreurs HTTP
     if (!response.ok) {
-      const errText = await response.text();
-      console.error('[Groq] Erreur API :', response.status, errText.substring(0, 500));
-      return "Je rencontre une difficulté technique. Veuillez réessayer dans quelques instants. 🏥";
+      const errText = await response.text()
+      console.error('[Groq] Erreur API:', response.status, errText.substring(0, 300))
+      return "Je rencontre une difficulté technique. Réessayez dans quelques instants. 🏥"
     }
 
-    // 4. Extraction de la réponse
-    const data = await response.json();
-    
-    if (data.choices && data.choices[0]?.message?.content) {
-      return data.choices[0].message.content;
-    } else {
-      console.error("[Groq] Structure de réponse inattendue :", data);
-      return "La réponse reçue est invalide.";
+    const data = await response.json()
+
+    if (data.choices?.[0]?.message?.content) {
+      return data.choices[0].message.content
     }
+
+    console.error('[Groq] Réponse inattendue:', JSON.stringify(data).substring(0, 200))
+    return "Réponse invalide reçue."
 
   } catch (error) {
-    console.error('[Groq] Erreur réseau ou système :', error);
-    return "Impossible de contacter le service pour le moment.";
+    console.error('[Groq] Erreur réseau:', error)
+    return "Impossible de contacter le service. Réessayez."
   }
 }
-
 // ── Traitement principal du message WhatsApp ─────────────────
 export async function traiterMessageEntrant(
   telephone: string,
@@ -156,10 +158,10 @@ export async function traiterMessageEntrant(
   }
 
   // 3. Construit l'historique pour Groq
-  const historique = conversation.messages.map(m => ({
-    role:    m.expediteur === 'PATIENT' ? 'user' : 'model',
-    content: m.contenu
-  }))
+ const historique = conversation.messages.map(m => ({
+  role:    m.expediteur === 'PATIENT' ? 'user' : 'assistant',
+  content: m.contenu
+}))
 
   // 4. Sauvegarde le message du patient
   await prisma.message.create({
