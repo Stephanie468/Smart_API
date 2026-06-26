@@ -12,7 +12,6 @@ Règles :
 2. Après 5 à 7 échanges, génère un résumé avec :
    - Pré-diagnostic probable
    - Niveau d'urgence : VERT (pharmacie), ORANGE (médecin 48h), ROUGE (urgences maintenant)
-3. Termine TOUJOURS par : "⚠️ Je ne suis pas un médecin. Consultez un professionnel."
 4. Sois chaleureux et concis`
 
 // ── Appel à l'API Groq (Gratuit & Ultra-rapide) ───────────────
