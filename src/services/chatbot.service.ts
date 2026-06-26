@@ -1,7 +1,7 @@
 import prisma from '../config/prisma.js'
 import { envoyerMessage } from './whatsapp.service.js'
 
-// ── Prompt système pour Gemini ───────────────────────────────
+// ── Prompt système pour Groq ─────────────────────────────────
 const SYSTEM_PROMPT = `Tu es Smart-Santé, un assistant médical bienveillant au Cameroun.
 Tu aides les patients à identifier leurs symptômes en français ou en anglais.
 
@@ -15,46 +15,65 @@ Règles :
 3. Termine TOUJOURS par : "⚠️ Je ne suis pas un médecin. Consultez un professionnel."
 4. Sois chaleureux et concis`
 
-// ── Appel à l'API Gemini ─────────────────────────────────────
-async function appellerGemini(
+// ── Appel à l'API Groq (Gratuit & Ultra-rapide) ───────────────
+async function appellerGroq(
   historique: Array<{ role: string; content: string }>,
   nouveauMessage: string
 ): Promise<string> {
 
-  // Construit l'historique au format Gemini
-  const contents = [
-    ...historique.map(m => ({
-      role: m.role === 'user' ? 'user' : 'model',
-      parts: [{ text: m.content }]
-    })),
-    {
-      role: 'user',
-      parts: [{ text: nouveauMessage }]
-    }
-  ]
-
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        systemInstruction: {
-          parts: [{ text: SYSTEM_PROMPT }]
-        },
-        contents
-      })
-    }
-  )
-
-  if (!response.ok) {
-    const err = await response.json()
-    console.error('[Gemini] Erreur:', err)
-    return "Je rencontre une difficulté technique. Veuillez réessayer dans quelques instants. 🏥"
+  // 1. Sécurité : Vérifier la clé API
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) {
+    console.error("[Groq] Erreur : La variable d'environnement GROQ_API_KEY n'est pas définie.");
+    return "Configuration manquante. Veuillez vérifier les variables d'environnement.";
   }
 
-  const data = await response.json()
-  return data.candidates[0].content.parts[0].text
+  // 2. Structurer les messages au format standard requis par Groq
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    ...historique.map(m => ({
+      // Groq utilise 'assistant' au lieu de 'model'
+      role: m.role === 'user' ? 'user' : 'assistant', 
+      content: m.content
+    })),
+    { role: 'user', content: nouveauMessage }
+  ];
+
+  try {
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: 'POST',
+      headers: { 
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json' 
+      },
+      body: JSON.stringify({
+        model: "llama3-8b-8192", // Modèle Llama 3 optimisé pour la vitesse et gratuit
+        messages: messages,
+        temperature: 0.5 // Légèrement abaissé pour des réponses médicales plus stables
+      })
+    });  
+
+    // 3. Gestion des erreurs HTTP
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error('[Groq] Erreur API :', response.status, errText.substring(0, 500));
+      return "Je rencontre une difficulté technique. Veuillez réessayer dans quelques instants. 🏥";
+    }
+
+    // 4. Extraction de la réponse
+    const data = await response.json();
+    
+    if (data.choices && data.choices[0]?.message?.content) {
+      return data.choices[0].message.content;
+    } else {
+      console.error("[Groq] Structure de réponse inattendue :", data);
+      return "La réponse reçue est invalide.";
+    }
+
+  } catch (error) {
+    console.error('[Groq] Erreur réseau ou système :', error);
+    return "Impossible de contacter le service pour le moment.";
+  }
 }
 
 // ── Traitement principal du message WhatsApp ─────────────────
@@ -136,7 +155,7 @@ export async function traiterMessageEntrant(
     })
   }
 
-  // 3. Construit l'historique pour Gemini
+  // 3. Construit l'historique pour Groq
   const historique = conversation.messages.map(m => ({
     role:    m.expediteur === 'PATIENT' ? 'user' : 'model',
     content: m.contenu
@@ -151,8 +170,8 @@ export async function traiterMessageEntrant(
     }
   })
 
-  // 5. Appelle Gemini
-  const reponseIA = await appellerGemini(historique, texte)
+  // 5. Appelle Groq au lieu de Gemini
+  const reponseIA = await appellerGroq(historique, texte)
 
   // 6. Sauvegarde la réponse
   await prisma.message.create({
