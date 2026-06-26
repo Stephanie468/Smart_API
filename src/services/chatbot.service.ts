@@ -47,7 +47,7 @@ async function appellerGroq(
         'Content-Type': 'application/json' 
       },
       body: JSON.stringify({
-        model: "llama3-8b-8192", // Modèle Llama 3 optimisé pour la vitesse et gratuit
+        model: "openai/gpt-oss-20b", // Modèle Llama 3 optimisé pour la vitesse et gratuit
         messages: messages,
         temperature: 0.5 // Légèrement abaissé pour des réponses médicales plus stables
       })
