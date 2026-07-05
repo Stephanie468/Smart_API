@@ -8,6 +8,7 @@ import authRoutes    from './routes/auth.routes.js'
 import uploadRoutes  from './routes/upload.routes.js'
 import webhookRoutes from './routes/webhook.routes.js'
 import patientRoutes from './routes/patient.routes.js'
+import adminRoutes   from './routes/admin.routes.js'
 
 dotenv.config()
 
@@ -45,6 +46,7 @@ app.use('/api/auth',    authRoutes)     // /api/auth/inscription/patient
 app.use('/api/upload',  uploadRoutes)   // /api/upload
 app.use('/api/webhook', webhookRoutes)  // /api/webhook (GET + POST)
 app.use('/api/patients', patientRoutes)  // /api/patients
+app.use('/api/admin',    adminRoutes)    // /api/admin
 
 // ── Route de test ─────────────────────────────────────────────
 app.get('/', (_req, res) => {
