@@ -9,6 +9,7 @@ import uploadRoutes  from './routes/upload.routes.js'
 import webhookRoutes from './routes/webhook.routes.js'
 import patientRoutes from './routes/patient.routes.js'
 import adminRoutes   from './routes/admin.routes.js'
+import medecinRoutes from './routes/medecin.routes.js'
 
 dotenv.config()
 
@@ -47,6 +48,7 @@ app.use('/api/upload',  uploadRoutes)   // /api/upload
 app.use('/api/webhook', webhookRoutes)  // /api/webhook (GET + POST)
 app.use('/api/patients', patientRoutes)  // /api/patients
 app.use('/api/admin',    adminRoutes)    // /api/admin
+app.use('/api/medecin',  medecinRoutes)  // /api/medecin
 
 // ── Route de test ─────────────────────────────────────────────
 app.get('/', (_req, res) => {
