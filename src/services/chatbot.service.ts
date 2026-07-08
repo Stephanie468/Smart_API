@@ -1,339 +1,331 @@
 import prisma from '../config/prisma.js'
-import { JourSemaine } from '@prisma/client'
-import type { ConsultationIA, Patient, Utilisateur, Pathologie, ConsultationPathologie } from '@prisma/client'
+import { envoyerMessage } from './whatsapp.service.js'
 
-type ConsultationIAAvecRelations = ConsultationIA & {
-  patient: Patient & { utilisateur: Pick<Utilisateur, 'nom' | 'prenom' | 'telephone'> }
-  pathologies: (ConsultationPathologie & { pathologie: Pathologie })[]
+// ── Prompt système pour Groq ─────────────────────────────────
+// (INCHANGÉ — ne pas modifier, comme demandé)
+const SYSTEM_PROMPT = `Tu es Smart-Santé, un assistant médical bienveillant au Cameroun.
+Tu aides les patients à identifier leurs symptômes en français ou en anglais et leur aporte des conseils sur les medicament qu'il peuvent 
+consommer et précisant la posologie au cas où le cas n'est pas grave (vert ou orange). si le cas est grave tu les encourage à consulter un médecin rapidement.
+
+Pathologies que tu connais : toutes pathologie possible sert toi des symptomes décrits par le patient pour identifier la pathologie probable.
+
+Règles :
+1. Pose UNE seule question courte à la fois
+2. Ne donne pas de diagnostic final avant d'avoir recueilli suffisamment d'informations (5 à 7 échanges avec des questions ciblées et pour les patients qui ne répondent pas meme après 15min,  relance les avec des questions simples) e si necessaire demande meme le groupe sanguin du patient pour mieux identifier la pathologie probable.
+3. Après 5 à 7 échanges, génère un résumé avec :
+   ===DIAGNOSTIC===
+SYMPTOMES: [résumé des symptômes]
+PATHOLOGIE: [nom de la pathologie suspectée]
+URGENCE: [VERT ou ORANGE ou ROUGE]
+RECOMMANDATIONS: [2-3 conseils pratiques]
+MEDICAMENTS: [liste des médicaments recommandés séparés par des virgules, ou AUCUN]
+POSOLOGIE: [dosage et durée pour chaque médicament, ou AUCUNE]
+===FIN===
+4. Sois chaleureux et concis et après les dignostique des cas simple, précise que ces medicaments ne remplacent pas un diagnostic médical mais c'est juste des conseils et qu'il doit demander conseil également au pharmatient pour se rassurer
+et pour les cas moyen préciser qu'il doivent rencontrer un medecin tout en leur demandant de se conecter à l'pplication pour prendre rendez vous avec un medecin. pour les cas grave,
+ne donne pas de medicament à prendre mais demande leur de prendre directement un rendez vous avec un medecin au plus vite via a plateforme.
+5. VERT = pharmacie suffit, ORANGE = médecin sous 48h, ROUGE = urgences maintenant`
+
+// ── Types utilitaires ─────────────────────────────────────────
+
+interface DiagnosticExtrait {
+  symptomes: string | null
+  pathologie: string | null
+  urgence: string | null
+  recommandations: string | null
+  medicaments: string | null
+  posologie: string | null
 }
 
+// ── Appel à l'API Groq (Gratuit & Ultra-rapide) ───────────────
+async function appellerGroq(
+  historique: Array<{ role: string; content: string }>,
+  nouveauMessage: string
+): Promise<string> {
+
+  const apiKey = process.env.GROQ_API_KEY
+  if (!apiKey) {
+    console.error("[Groq] GROQ_API_KEY manquante")
+    return "Configuration manquante. Contactez l'administrateur."
+  }
+
+  // ✅ Messages bien formatés — role doit être 'user' ou 'assistant' uniquement
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    ...historique.map(m => ({
+      role:    m.role === 'user' ? 'user' : 'assistant',
+      content: m.content
+    })),
+    { role: 'user', content: nouveauMessage }
+  ]
+
+  try {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type':  'application/json'
+      },
+      body: JSON.stringify({
+        model:       'llama-3.3-70b-versatile',
+        messages,
+        temperature: 0.4,
+        max_tokens:  500,
+        tool_choice: 'none',
+      })
+    })
+
+    if (!response.ok) {
+      const errText = await response.text()
+      console.error('[Groq] Erreur API:', response.status, errText.substring(0, 300))
+      return "Je rencontre une difficulté technique. Réessayez dans quelques instants. 🏥"
+    }
+
+    const data = await response.json()
+
+    if (data.choices?.[0]?.message?.content) {
+      return data.choices[0].message.content
+    }
+
+    console.error('[Groq] Réponse inattendue:', JSON.stringify(data).substring(0, 200))
+    return "Réponse invalide reçue."
+
+  } catch (error) {
+    console.error('[Groq] Erreur réseau:', error)
+    return "Impossible de contacter le service. Réessayez."
+  }
+}
+
+// ── Extraction du bloc structuré ===DIAGNOSTIC=== ... ===FIN=== ─
 /**
- * Service gérant la logique métier pour l'espace médecin.
- *
- * ⚠️ RÈGLE DE CONFIDENTIALITÉ CENTRALE (secret médical / RGPD) :
- * Un médecin ne voit la fiche de pré-diagnostic IA d'un patient QUE si :
- *   1. Le patient a pris rendez-vous avec CE médecin précis (relation explicite)
- *   2. La fiche IA a été générée avant (ou à) la date de ce rendez-vous
- *      (dateConsultation <= dateHeure du rendez-vous). On utilise `dateHeure`
- *      (champ déjà existant, pas de migration) plutôt qu'une date de création
- *      du RDV : ça permet au médecin de voir l'état de santé le plus à jour
- *      du patient jusqu'à la date du rendez-vous, ce qui est le comportement
- *      attendu (le médecin doit connaître le dernier pré-diagnostic avant de
- *      recevoir le patient).
- *   3. Seule LA PLUS RÉCENTE fiche répondant aux deux conditions ci-dessus
- *      est affichée — jamais tout l'historique du patient.
- *
- * Si le patient prend un nouveau rendez-vous plus tardif avec ce médecin,
- * la fenêtre d'autorisation s'élargit automatiquement jusqu'à cette nouvelle
- * date, et la fiche la plus récente à ce moment-là devient visible.
+ * Analyse la réponse brute de l'IA et extrait les champs structurés
+ * définis dans le prompt système (SYMPTOMES, PATHOLOGIE, URGENCE,
+ * RECOMMANDATIONS, MEDICAMENTS, POSOLOGIE).
+ * Retourne `null` si aucun bloc diagnostic n'est présent.
  */
-export class MedecinService {
+function extraireBlocDiagnostic(reponseIA: string): DiagnosticExtrait | null {
+  const blocMatch = reponseIA.match(/===DIAGNOSTIC===([\s\S]*?)===FIN===/i)
+  if (!blocMatch) return null
 
-  /**
-   * Calcule, pour ce médecin, la fiche IA la plus récente autorisée pour
-   * chaque patient ayant un rendez-vous avec lui.
-   *
-   * On utilise `dateHeure` (date du rendez-vous, déjà existante dans le
-   * schéma — pas besoin de migration) comme ligne de démarcation : seules
-   * les fiches IA antérieures ou égales à la date du rendez-vous le plus
-   * tardif sont visibles. Cela garantit que le médecin voit l'état de santé
-   * le plus à jour du patient avant de le recevoir, sans jamais dévoiler
-   * une fiche postérieure à un rendez-vous déjà passé sans suite.
-   *
-   * Retourne une Map<patientId, ConsultationIA> — une seule fiche par patient.
-   */
-  private static async getConsultationsAutoriseesMap(
-    medecinId: string
-  ): Promise<Map<string, ConsultationIAAvecRelations>> {
+  const bloc = blocMatch[1]
 
-    // 1. Date du rendez-vous le plus tardif, par patient, pour ce médecin
-    const groupes = await prisma.rendezVous.groupBy({
-      by: ['patientId'],
-      where: { medecinId },
-      _max: { dateHeure: true }
-    })
-
-    if (groupes.length === 0) {
-      return new Map()
-    }
-
-    // 2. Récupère les fiches IA de ces patients, uniquement celles antérieures
-    // ou égales à la date de leur rendez-vous le plus tardif avec CE médecin
-    const consultations = await prisma.consultationIA.findMany({
-      where: {
-        OR: groupes.map(g => ({
-          patientId: g.patientId,
-          dateConsultation: { lte: g._max.dateHeure! }
-        }))
-      },
-      orderBy: { dateConsultation: 'desc' },
-      include: {
-        patient: {
-          include: {
-            utilisateur: { select: { nom: true, prenom: true, telephone: true } }
-          }
-        },
-        pathologies: { include: { pathologie: true } }
-      }
-    })
-
-    // 3. Ne garde que LA PLUS RÉCENTE fiche par patient
-    // (la liste est déjà triée desc, donc la première rencontrée par patient = la plus récente)
-    const dernieresParPatient = new Map<string, ConsultationIAAvecRelations>()
-    for (const consultation of consultations) {
-      if (!dernieresParPatient.has(consultation.patientId)) {
-        dernieresParPatient.set(consultation.patientId, consultation as ConsultationIAAvecRelations)
-      }
-    }
-
-    return dernieresParPatient
+  const extraireChamp = (nomChamp: string): string | null => {
+    const regex = new RegExp(`${nomChamp}\\s*:\\s*(.+)`, 'i')
+    const trouve = bloc.match(regex)
+    return trouve ? trouve[1].trim() : null
   }
 
-  /**
-   * Vérifie qu'un médecin a le droit de voir UNE fiche IA précise, et que
-   * cette fiche est bien la plus récente autorisée pour ce patient (pas une
-   * fiche plus ancienne remplacée, ni une fiche future non liée au rendez-vous).
-   * Lève une erreur explicite si l'accès est refusé.
-   */
-  private static async verifierAccesConsultation(
-    medecinId: string,
-    consultationId: string
-  ): Promise<ConsultationIAAvecRelations> {
+  return {
+    symptomes:       extraireChamp('SYMPTOMES'),
+    pathologie:      extraireChamp('PATHOLOGIE'),
+    urgence:         extraireChamp('URGENCE'),
+    recommandations: extraireChamp('RECOMMANDATIONS'),
+    medicaments:     extraireChamp('MEDICAMENTS'),
+    posologie:       extraireChamp('POSOLOGIE'),
+  }
+}
 
-    const consultation = await prisma.consultationIA.findUnique({
-      where: { id: consultationId },
-      include: {
-        patient: {
-          include: { utilisateur: { select: { nom: true, prenom: true, telephone: true } } }
-        },
-        pathologies: { include: { pathologie: true } }
-      }
-    })
+/** Vérifie si une valeur de champ signifie "rien" (AUCUN / AUCUNE / vide) */
+function estValeurVide(valeur: string | null): boolean {
+  if (!valeur) return true
+  const normalise = valeur.trim().toUpperCase()
+  return normalise === '' || normalise === 'AUCUN' || normalise === 'AUCUNE'
+}
 
-    if (!consultation) {
-      throw new Error('Consultation introuvable')
-    }
+// ── Enregistrement de l'ordonnance IA + rappels médicaments ────
+/**
+ * Si l'IA a recommandé des médicaments (cas VERT ou ORANGE en général),
+ * crée une Ordonnance à des fins de TRAÇABILITÉ UNIQUEMENT
+ * (historique patient, audit, statistiques) — genereParIA = true.
+ *
+ * ⚠️ Volontairement, aucun RappelMedicament n'est créé ici : les rappels
+ * de prise sont réservés aux prescriptions issues d'une téléconsultation
+ * avec un médecin réel (module chat/téléconsultation), pas aux conseils
+ * ponctuels de l'IA WhatsApp.
+ *
+ * Cette fonction est isolée et protégée par try/catch : un échec ici
+ * ne doit JAMAIS empêcher l'envoi de la réponse au patient.
+ */
+async function enregistrerOrdonnanceIA(
+  patientId: string,
+  consultationIAId: string,
+  diagnostic: DiagnosticExtrait
+): Promise<void> {
 
-    // Date du rendez-vous le plus tardif pris par ce patient avec ce médecin
-    const dernierRendezVous = await prisma.rendezVous.findFirst({
-      where: { medecinId, patientId: consultation.patientId },
-      orderBy: { dateHeure: 'desc' },
-      select: { dateHeure: true }
-    })
-
-    if (!dernierRendezVous) {
-      throw new Error("Accès refusé : ce patient n'a jamais pris rendez-vous avec vous.")
-    }
-
-    if (consultation.dateConsultation > dernierRendezVous.dateHeure) {
-      throw new Error(
-        "Accès refusé : cette fiche est postérieure à votre rendez-vous avec ce patient."
-      )
-    }
-
-    // Vérifie qu'il n'existe pas une fiche plus récente qui aurait dû
-    // remplacer celle-ci dans l'affichage (on ne montre jamais une fiche périmée)
-    const ficheLaPlusRecenteAutorisee = await prisma.consultationIA.findFirst({
-      where: {
-        patientId: consultation.patientId,
-        dateConsultation: { lte: dernierRendezVous.dateHeure }
-      },
-      orderBy: { dateConsultation: 'desc' },
-      select: { id: true }
-    })
-
-    if (!ficheLaPlusRecenteAutorisee || ficheLaPlusRecenteAutorisee.id !== consultation.id) {
-      throw new Error("Accès refusé : seule la fiche la plus récente de ce patient est consultable.")
-    }
-
-    return consultation as ConsultationIAAvecRelations
+  if (estValeurVide(diagnostic.medicaments)) {
+    // Rien à tracer (cas ROUGE, ou IA n'a proposé aucun médicament)
+    return
   }
 
-  /**
-   * Récupère les données du tableau de bord d'un médecin.
-   * @param medecinId ID du médecin connecté.
-   */
-  static async getDashboardData(medecinId: string) {
-    const medecin = await prisma.medecin.findUnique({
-      where: { id: medecinId },
-      include: {
-        utilisateur: { select: { nom: true, prenom: true } },
-        formationSanitaire: true
-      }
-    })
+  try {
+    const contenuOrdonnance =
+      `Pathologie suspectée : ${diagnostic.pathologie ?? 'Non précisée'}\n` +
+      `Médicaments évoqués : ${diagnostic.medicaments}\n` +
+      `Posologie : ${diagnostic.posologie ?? 'Non précisée'}\n\n` +
+      `⚠️ Conseil généré automatiquement par l'IA Smart-Santé (traçabilité uniquement). ` +
+      `Ne remplace pas l'avis d'un médecin ou d'un pharmacien.`
 
-    if (!medecin) {
-      throw new Error('Médecin introuvable')
-    }
-
-    // ── Fiches IA autorisées : une seule par patient, la plus récente,
-    // et uniquement pour les patients ayant pris rendez-vous avec ce médecin ──
-    const dernieresConsultations = await this.getConsultationsAutoriseesMap(medecinId)
-    const consultationsAutorisees = Array.from(dernieresConsultations.values())
-
-    const fichesNonTraitees = consultationsAutorisees.filter(c => !c.suiviEffectue)
-    const fichesEnAttenteCount = fichesNonTraitees.length
-    const fileAttente = fichesNonTraitees.slice(0, 10)
-
-    // Téléconsultations du jour
-    const debutJour = new Date()
-    debutJour.setHours(0, 0, 0, 0)
-    const finJour = new Date()
-    finJour.setHours(23, 59, 59, 999)
-
-    const teleconsultationsCount = await prisma.rendezVous.count({
-      where: { medecinId, dateHeure: { gte: debutJour, lte: finJour } }
-    })
-
-    // Patients uniques vus ce mois-ci
-    const debutMois = new Date()
-    debutMois.setDate(1)
-    debutMois.setHours(0, 0, 0, 0)
-
-    const rendezVousCeMois = await prisma.rendezVous.findMany({
-      where: { medecinId, dateHeure: { gte: debutMois } },
-      select: { patientId: true }
-    })
-    const patientsCeMoisCount = new Set(rendezVousCeMois.map(r => r.patientId)).size
-
-    // Planning du jour (déjà sécurisé : filtré par medecinId)
-    const planningJour = await prisma.rendezVous.findMany({
-      where: { medecinId, dateHeure: { gte: debutJour, lte: finJour } },
-      orderBy: { dateHeure: 'asc' },
-      include: {
-        patient: { include: { utilisateur: { select: { nom: true, prenom: true, telephone: true } } } },
-        creneau: true
-      }
-    })
-
-    return {
-      medecin: {
-        nom: medecin.utilisateur.nom,
-        prenom: medecin.utilisateur.prenom,
-        specialite: medecin.specialite,
-        structure: medecin.formationSanitaire?.nom || 'Cabinet Indépendant'
-      },
-      kpis: {
-        fichesEnAttente: fichesEnAttenteCount,
-        teleconsultations: teleconsultationsCount,
-        patientsCeMois: patientsCeMoisCount,
-        tempsMoyen: '18 min'
-      },
-      fileAttente,
-      planningJour
-    }
-  }
-
-  /**
-   * Récupère, pour chaque patient ayant un rendez-vous avec ce médecin,
-   * uniquement SA fiche IA la plus récente autorisée.
-   */
-  static async getPatientsConsultations(medecinId: string) {
-    const medecin = await prisma.medecin.findUnique({
-      where: { id: medecinId },
-      select: { id: true }
-    })
-
-    if (!medecin) {
-      throw new Error('Médecin introuvable')
-    }
-
-    const dernieresConsultations = await this.getConsultationsAutoriseesMap(medecinId)
-    return Array.from(dernieresConsultations.values())
-  }
-
-  /**
-   * Récupère le détail d'UNE fiche de consultation IA précise.
-   * Vérifie que la fiche est bien autorisée ET qu'elle est la plus récente
-   * (protection contre un accès direct par ID — IDOR — et contre l'affichage
-   * d'une fiche périmée ou postérieure au rendez-vous).
-   */
-  static async getConsultationDetail(medecinId: string, consultationId: string) {
-    return this.verifierAccesConsultation(medecinId, consultationId)
-  }
-
-  /**
-   * Valide un diagnostic, crée une ordonnance et marque la consultation IA comme traitée.
-   * Vérifie d'abord que le médecin a bien le droit d'agir sur CETTE fiche précise
-   * (même règle que la consultation : la plus récente, antérieure au rendez-vous).
-   */
-  static async creerPrescription(
-    medecinId: string,
-    data: {
-      consultationId: string
-      patientId: string
-      contenu: string
-      rendezVousId?: string
-    }
-  ) {
-    // ── Vérification d'autorisation AVANT toute écriture ──
-    const consultation = await this.verifierAccesConsultation(medecinId, data.consultationId)
-
-    // Cohérence défensive : le patientId fourni doit correspondre à la consultation
-    if (consultation.patientId !== data.patientId) {
-      throw new Error('Incohérence : le patient ne correspond pas à la consultation fournie.')
-    }
-
-    return prisma.$transaction(async (tx) => {
-      const ordonnance = await tx.ordonnance.create({
-        data: {
-          patientId: data.patientId,
-          medecinId,
-          rendezVousId: data.rendezVousId || null,
-          contenu: data.contenu,
-          dateEmission: new Date()
-        }
-      })
-
-      await tx.consultationIA.update({
-        where: { id: data.consultationId },
-        data: {
-          suiviEffectue: true,
-          suiviReponse: data.contenu,
-          suiviDateRelance: new Date()
-        }
-      })
-
-      return ordonnance
-    })
-  }
-
-  /**
-   * Récupère les créneaux et les rendez-vous hebdomadaires du médecin.
-   * (Déjà sécurisé : filtré par medecinId dès le départ.)
-   */
-  static async getPlanning(medecinId: string) {
-    const creneaux = await prisma.creneau.findMany({
-      where: { medecinId },
-      orderBy: [{ jourSemaine: 'asc' }, { heureDebut: 'asc' }]
-    })
-
-    const rendezVous = await prisma.rendezVous.findMany({
-      where: { medecinId },
-      orderBy: { dateHeure: 'asc' },
-      include: {
-        patient: { include: { utilisateur: { select: { nom: true, prenom: true } } } }
-      }
-    })
-
-    return { creneaux, rendezVous }
-  }
-
-  /**
-   * Crée un nouveau créneau de disponibilité pour le médecin.
-   */
-  static async creerCreneau(
-    medecinId: string,
-    data: { jourSemaine: JourSemaine; heureDebut: string; heureFin: string }
-  ) {
-    return prisma.creneau.create({
+    const ordonnance = await prisma.ordonnance.create({
       data: {
-        medecinId,
-        jourSemaine: data.jourSemaine,
-        heureDebut: data.heureDebut,
-        heureFin: data.heureFin,
-        disponible: true
+        patientId,
+        medecinId:        null,   // aucune ordonnance IA n'est signée par un médecin humain
+        consultationIAId,         // traçabilité vers la consultation d'origine
+        contenu:           contenuOrdonnance,
+        envoyeeWhatsApp:   true,
+        genereParIA:       true,
       }
     })
+
+    console.log(
+      `[Ordonnance IA] Créée (${ordonnance.id}) pour traçabilité — patient ${patientId}`
+    )
+
+  } catch (error) {
+    // On log l'erreur mais on ne bloque jamais l'envoi du message WhatsApp
+    console.error('[Ordonnance IA] Échec de l\'enregistrement:', error)
   }
+}
+
+// ── Traitement principal du message WhatsApp ─────────────────
+export async function traiterMessageEntrant(
+  telephone: string,
+  texte: string,
+  nomWA: string
+): Promise<void> {
+
+  // 1. Trouve ou crée le patient
+  let utilisateur = await prisma.utilisateur.findUnique({
+    where: { telephone },
+    include: { patient: true }
+  })
+
+  if (!utilisateur) {
+    utilisateur = await prisma.utilisateur.create({
+      data: {
+        nom:      nomWA.split(' ')[0] || 'Patient',
+        prenom:   nomWA.split(' ').slice(1).join(' ') || '',
+        telephone,
+        role:     'PATIENT',
+        statut:   'ACTIF',
+        patient:  { create: { langue: 'FR' } }
+      },
+      include: { patient: true }
+    })
+
+    await envoyerMessage(telephone,
+      `👋 Bonjour *${nomWA}* ! Bienvenue sur *Smart-Santé Cameroun* 🏥\n\n` +
+      `Je suis votre assistant médical IA.\n\n` +
+      `Avant de commencer, puis-je connaître votre *ville de résidence* ?\n` +
+      `_(Ex: Douala, Yaoundé, Bafoussam...)_`
+    )
+    return
+  }
+
+  // Gestion de l'onboarding progressif
+  const patient = utilisateur.patient!
+
+  if (!patient.ville) {
+    await prisma.patient.update({
+      where: { id: patient.id },
+      data: { ville: texte.trim(), localisation: texte.trim() }
+    })
+    await envoyerMessage(telephone,
+      `✅ Noté ! Vous êtes à *${texte.trim()}*.\n\n` +
+      `Quel est votre *âge* approximatif ?\n_(Ex: 25 ans)_`
+    )
+    return
+  }
+
+  if (!patient.antecedents) {
+    await prisma.patient.update({
+      where: { id: patient.id },
+      data: { antecedents: `Âge déclaré : ${texte.trim()}` }
+    })
+    await envoyerMessage(telephone,
+      `✅ Parfait !\n\n` +
+      `Votre profil est maintenant complet. 🎉\n\n` +
+      `Vous pouvez maintenant *décrire vos symptômes* et je vous aiderai à comprendre votre état de santé.\n\n` +
+      `_Exemple : "j'ai de la fièvre depuis 2 jours et des maux de tête"_`
+    )
+    return
+  }
+
+  const patientId = utilisateur.patient!.id
+
+  // 2. Récupère ou crée la conversation active
+  let conversation = await prisma.conversation.findFirst({
+    where: { patientId, statut: 'EN_COURS', canal: 'WHATSAPP' },
+    include: { messages: { orderBy: { horodatage: 'asc' } } }
+  })
+
+  if (!conversation) {
+    conversation = await prisma.conversation.create({
+      data: { patientId, canal: 'WHATSAPP', statut: 'EN_COURS' },
+      include: { messages: true }
+    })
+  }
+
+  // 3. Construit l'historique pour Groq
+  const historique = conversation.messages.map(m => ({
+    role:    m.expediteur === 'PATIENT' ? 'user' : 'assistant',
+    content: m.contenu
+  }))
+
+  // 4. Sauvegarde le message du patient
+  await prisma.message.create({
+    data: {
+      conversationId: conversation.id,
+      contenu:        texte,
+      expediteur:     'PATIENT'
+    }
+  })
+
+  // 5. Appelle Groq
+  const reponseIA = await appellerGroq(historique, texte)
+
+  // 6. Sauvegarde la réponse
+  await prisma.message.create({
+    data: {
+      conversationId: conversation.id,
+      contenu:        reponseIA,
+      expediteur:     'IA'
+    }
+  })
+
+  // 7. Détecte si c'est un diagnostic final et extrait les champs structurés
+  const estFinal =
+    reponseIA.includes('VERT') ||
+    reponseIA.includes('ORANGE') ||
+    reponseIA.includes('ROUGE')
+
+  if (estFinal) {
+    const urgence = reponseIA.includes('ROUGE') ? 'ROUGE'
+                  : reponseIA.includes('ORANGE') ? 'ORANGE'
+                  : 'VERT'
+
+    const consultation = await prisma.consultationIA.create({
+      data: {
+        patientId,
+        conversationId:   conversation.id,
+        symptomes:        historique.filter(m => m.role === 'user').map(m => m.content).join(' | '),
+        preDiagnostic:    reponseIA,
+        niveauUrgence:    urgence,
+        suiviDateRelance: new Date(Date.now() + 48 * 60 * 60 * 1000)
+      }
+    })
+
+    await prisma.conversation.update({
+      where: { id: conversation.id },
+      data:  { statut: 'TERMINEE', dateFin: new Date() }
+    })
+
+    // ── Traçabilité : enregistrement de l'ordonnance IA (sans rappel) ──
+    const diagnostic = extraireBlocDiagnostic(reponseIA)
+    if (diagnostic) {
+      await enregistrerOrdonnanceIA(patientId, consultation.id, diagnostic)
+    }
+  }
+
+  // 8. Envoie la réponse au patient
+  await envoyerMessage(telephone, reponseIA)
 }
