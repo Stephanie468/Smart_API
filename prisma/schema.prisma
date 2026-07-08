@@ -240,6 +240,7 @@ model ConsultationIA {
 
   pathologies  ConsultationPathologie[]
   orientations ConsultationOrientation[]
+  ordonnances Ordonnance[]
 
   @@index([patientId, dateConsultation])
   @@index([niveauUrgence, dateConsultation])
@@ -332,14 +333,19 @@ model Ordonnance {
   id              String   @id @default(uuid())
   patientId       String
   patient         Patient  @relation(fields: [patientId], references: [id], onDelete: Cascade)
-  medecinId       String
-  medecin         Medecin  @relation(fields: [medecinId], references: [id], onDelete: Cascade)
+  medecinId       String?
+  medecin         Medecin?  @relation(fields: [medecinId], references: [id], onDelete: Cascade)
   rendezVousId    String?
   rendezVous      RendezVous? @relation(fields: [rendezVousId], references: [id], onDelete: SetNull)
   contenu         String   @db.Text
   dateEmission    DateTime @default(now())
   envoyeeWhatsApp Boolean  @default(false)
   cheminFichier   String?
+  genereParIA     Boolean     @default(false)
+  consultationIAId String?
+  consultationIA  ConsultationIA? @relation(fields: [consultationIAId], references: [id], onDelete: SetNull)
+
+  @@index([genereParIA])
 
   @@index([patientId, dateEmission])
   @@map("ordonnance")

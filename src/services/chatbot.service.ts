@@ -2,17 +2,40 @@ import prisma from '../config/prisma.js'
 import { envoyerMessage } from './whatsapp.service.js'
 
 // ── Prompt système pour Groq ─────────────────────────────────
+// (INCHANGÉ — ne pas modifier, comme demandé)
 const SYSTEM_PROMPT = `Tu es Smart-Santé, un assistant médical bienveillant au Cameroun.
-Tu aides les patients à identifier leurs symptômes en français ou en anglais.
+Tu aides les patients à identifier leurs symptômes en français ou en anglais et leur aporte des conseils sur les medicament qu'il peuvent 
+consommer et précisant la posologie au cas où le cas n'est pas grave (vert ou orange). si le cas est grave tu les encourage à consulter un médecin rapidement.
 
-Pathologies que tu connais : paludisme, typhoïde, infections respiratoires, dermatoses, diarrhées infectieuses.
+Pathologies que tu connais : toutes pathologie possible sert toi des symptomes décrits par le patient pour identifier la pathologie probable.
 
 Règles :
 1. Pose UNE seule question courte à la fois
-2. Après 5 à 7 échanges, génère un résumé avec :
-   - Pré-diagnostic probable
-   - Niveau d'urgence : VERT (pharmacie), ORANGE (médecin 48h), ROUGE (urgences maintenant)
-4. Sois chaleureux et concis`
+2. Ne donne pas de diagnostic final avant d'avoir recueilli suffisamment d'informations (5 à 7 échanges avec des questions ciblées et pour les patients qui ne répondent pas meme après 15min,  relance les avec des questions simples) e si necessaire demande meme le groupe sanguin du patient pour mieux identifier la pathologie probable.
+3. Après 5 à 7 échanges, génère un résumé avec :
+   ===DIAGNOSTIC===
+SYMPTOMES: [résumé des symptômes]
+PATHOLOGIE: [nom de la pathologie suspectée]
+URGENCE: [VERT ou ORANGE ou ROUGE]
+RECOMMANDATIONS: [2-3 conseils pratiques]
+MEDICAMENTS: [liste des médicaments recommandés séparés par des virgules, ou AUCUN]
+POSOLOGIE: [dosage et durée pour chaque médicament, ou AUCUNE]
+===FIN===
+4. Sois chaleureux et concis et après les dignostique des cas simple, précise que ces medicaments ne remplacent pas un diagnostic médical mais c'est juste des conseils et qu'il doit demander conseil également au pharmatient pour se rassurer
+et pour les cas moyen préciser qu'il doivent rencontrer un medecin tout en leur demandant de se conecter à l'pplication pour prendre rendez vous avec un medecin. pour les cas grave,
+ne donne pas de medicament à prendre mais demande leur de prendre directement un rendez vous avec un medecin au plus vite via a plateforme.
+5. VERT = pharmacie suffit, ORANGE = médecin sous 48h, ROUGE = urgences maintenant`
+
+// ── Types utilitaires ─────────────────────────────────────────
+
+interface DiagnosticExtrait {
+  symptomes: string | null
+  pathologie: string | null
+  urgence: string | null
+  recommandations: string | null
+  medicaments: string | null
+  posologie: string | null
+}
 
 // ── Appel à l'API Groq (Gratuit & Ultra-rapide) ───────────────
 async function appellerGroq(
@@ -44,15 +67,10 @@ async function appellerGroq(
         'Content-Type':  'application/json'
       },
       body: JSON.stringify({
-        // ✅ Modèles Groq gratuits disponibles en 2026
-        // llama-3.3-70b-versatile → meilleur pour le médical
-        // llama-3.1-8b-instant    → plus rapide mais moins précis
         model:       'llama-3.3-70b-versatile',
         messages,
         temperature: 0.4,
         max_tokens:  500,
-        // ✅ IMPORTANT : désactive explicitement les tools
-        // C'est ce qui causait l'erreur "tool choice is none but model called a tool"
         tool_choice: 'none',
       })
     })
@@ -77,6 +95,97 @@ async function appellerGroq(
     return "Impossible de contacter le service. Réessayez."
   }
 }
+
+// ── Extraction du bloc structuré ===DIAGNOSTIC=== ... ===FIN=== ─
+/**
+ * Analyse la réponse brute de l'IA et extrait les champs structurés
+ * définis dans le prompt système (SYMPTOMES, PATHOLOGIE, URGENCE,
+ * RECOMMANDATIONS, MEDICAMENTS, POSOLOGIE).
+ * Retourne `null` si aucun bloc diagnostic n'est présent.
+ */
+function extraireBlocDiagnostic(reponseIA: string): DiagnosticExtrait | null {
+  const blocMatch = reponseIA.match(/===DIAGNOSTIC===([\s\S]*?)===FIN===/i)
+  if (!blocMatch) return null
+
+  const bloc = blocMatch[1]
+
+  const extraireChamp = (nomChamp: string): string | null => {
+    const regex = new RegExp(`${nomChamp}\\s*:\\s*(.+)`, 'i')
+    const trouve = bloc.match(regex)
+    return trouve ? trouve[1].trim() : null
+  }
+
+  return {
+    symptomes:       extraireChamp('SYMPTOMES'),
+    pathologie:      extraireChamp('PATHOLOGIE'),
+    urgence:         extraireChamp('URGENCE'),
+    recommandations: extraireChamp('RECOMMANDATIONS'),
+    medicaments:     extraireChamp('MEDICAMENTS'),
+    posologie:       extraireChamp('POSOLOGIE'),
+  }
+}
+
+/** Vérifie si une valeur de champ signifie "rien" (AUCUN / AUCUNE / vide) */
+function estValeurVide(valeur: string | null): boolean {
+  if (!valeur) return true
+  const normalise = valeur.trim().toUpperCase()
+  return normalise === '' || normalise === 'AUCUN' || normalise === 'AUCUNE'
+}
+
+// ── Enregistrement de l'ordonnance IA + rappels médicaments ────
+/**
+ * Si l'IA a recommandé des médicaments (cas VERT ou ORANGE en général),
+ * crée une Ordonnance à des fins de TRAÇABILITÉ UNIQUEMENT
+ * (historique patient, audit, statistiques) — genereParIA = true.
+ *
+ * ⚠️ Volontairement, aucun RappelMedicament n'est créé ici : les rappels
+ * de prise sont réservés aux prescriptions issues d'une téléconsultation
+ * avec un médecin réel (module chat/téléconsultation), pas aux conseils
+ * ponctuels de l'IA WhatsApp.
+ *
+ * Cette fonction est isolée et protégée par try/catch : un échec ici
+ * ne doit JAMAIS empêcher l'envoi de la réponse au patient.
+ */
+async function enregistrerOrdonnanceIA(
+  patientId: string,
+  consultationIAId: string,
+  diagnostic: DiagnosticExtrait
+): Promise<void> {
+
+  if (estValeurVide(diagnostic.medicaments)) {
+    // Rien à tracer (cas ROUGE, ou IA n'a proposé aucun médicament)
+    return
+  }
+
+  try {
+    const contenuOrdonnance =
+      `Pathologie suspectée : ${diagnostic.pathologie ?? 'Non précisée'}\n` +
+      `Médicaments évoqués : ${diagnostic.medicaments}\n` +
+      `Posologie : ${diagnostic.posologie ?? 'Non précisée'}\n\n` +
+      `⚠️ Conseil généré automatiquement par l'IA Smart-Santé (traçabilité uniquement). ` +
+      `Ne remplace pas l'avis d'un médecin ou d'un pharmacien.`
+
+    const ordonnance = await prisma.ordonnance.create({
+      data: {
+        patientId,
+        medecinId:        null,   // aucune ordonnance IA n'est signée par un médecin humain
+        consultationIAId,         // traçabilité vers la consultation d'origine
+        contenu:           contenuOrdonnance,
+        envoyeeWhatsApp:   true,
+        genereParIA:       true,
+      }
+    })
+
+    console.log(
+      `[Ordonnance IA] Créée (${ordonnance.id}) pour traçabilité — patient ${patientId}`
+    )
+
+  } catch (error) {
+    // On log l'erreur mais on ne bloque jamais l'envoi du message WhatsApp
+    console.error('[Ordonnance IA] Échec de l\'enregistrement:', error)
+  }
+}
+
 // ── Traitement principal du message WhatsApp ─────────────────
 export async function traiterMessageEntrant(
   telephone: string,
@@ -157,10 +266,10 @@ export async function traiterMessageEntrant(
   }
 
   // 3. Construit l'historique pour Groq
- const historique = conversation.messages.map(m => ({
-  role:    m.expediteur === 'PATIENT' ? 'user' : 'assistant',
-  content: m.contenu
-}))
+  const historique = conversation.messages.map(m => ({
+    role:    m.expediteur === 'PATIENT' ? 'user' : 'assistant',
+    content: m.contenu
+  }))
 
   // 4. Sauvegarde le message du patient
   await prisma.message.create({
@@ -171,7 +280,7 @@ export async function traiterMessageEntrant(
     }
   })
 
-  // 5. Appelle Groq au lieu de Gemini
+  // 5. Appelle Groq
   const reponseIA = await appellerGroq(historique, texte)
 
   // 6. Sauvegarde la réponse
@@ -183,7 +292,7 @@ export async function traiterMessageEntrant(
     }
   })
 
-  // 7. Détecte si c'est un diagnostic final
+  // 7. Détecte si c'est un diagnostic final et extrait les champs structurés
   const estFinal =
     reponseIA.includes('VERT') ||
     reponseIA.includes('ORANGE') ||
@@ -194,7 +303,7 @@ export async function traiterMessageEntrant(
                   : reponseIA.includes('ORANGE') ? 'ORANGE'
                   : 'VERT'
 
-    await prisma.consultationIA.create({
+    const consultation = await prisma.consultationIA.create({
       data: {
         patientId,
         conversationId:   conversation.id,
@@ -209,6 +318,12 @@ export async function traiterMessageEntrant(
       where: { id: conversation.id },
       data:  { statut: 'TERMINEE', dateFin: new Date() }
     })
+
+    // ── Traçabilité : enregistrement de l'ordonnance IA (sans rappel) ──
+    const diagnostic = extraireBlocDiagnostic(reponseIA)
+    if (diagnostic) {
+      await enregistrerOrdonnanceIA(patientId, consultation.id, diagnostic)
+    }
   }
 
   // 8. Envoie la réponse au patient
