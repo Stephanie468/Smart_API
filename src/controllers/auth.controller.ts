@@ -199,7 +199,7 @@ export const connexion = async (req: Request, res: Response) => {
     if (!utilisateur)
       return res.status(401).json({ message: 'Aucun compte trouvé.' })
 
-    // ── Patient → mot de passe si disponible, sinon OTP ───
+    // ── Patient → validation du mot de passe puis envoi d'un OTP ───
     if (utilisateur.role === 'PATIENT') {
       if (motDePasse) {
         if (!utilisateur.motDePasseHash) {
@@ -210,24 +210,6 @@ export const connexion = async (req: Request, res: Response) => {
         if (!valide) {
           return res.status(401).json({ message: 'Mot de passe incorrect.' })
         }
-
-        const token = jwt.sign(
-          { id: utilisateur.id, role: utilisateur.role },
-          process.env.JWT_SECRET as string,
-          { expiresIn: '7d' }
-        )
-
-        return res.status(200).json({
-          message: 'Connexion réussie.',
-          token,
-          utilisateur: {
-            id: utilisateur.id,
-            nom: utilisateur.nom,
-            prenom: utilisateur.prenom,
-            telephone: utilisateur.telephone,
-            role: utilisateur.role
-          }
-        })
       }
 
       const otpCode = genererOTP()
