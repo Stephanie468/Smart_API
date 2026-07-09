@@ -320,6 +320,66 @@ export class MedecinService {
   }
 
   /**
+   * Récupère les demandes de rendez-vous en attente d'un médecin.
+   */
+  static async getDemandesRendezVous(medecinId: string) {
+    return prisma.rendezVous.findMany({
+      where: { medecinId, statut: 'EN_ATTENTE' },
+      orderBy: { dateHeure: 'asc' },
+      include: {
+        patient: { include: { utilisateur: { select: { nom: true, prenom: true, telephone: true } } } },
+        creneau: true
+      }
+    })
+  }
+
+  /**
+   * Met à jour le statut d'une demande de rendez-vous du médecin.
+   */
+  static async mettreAJourStatutRendezVous(
+    medecinId: string,
+    rendezVousId: string,
+    statut: 'CONFIRME' | 'ANNULE'
+  ) {
+    if (!['CONFIRME', 'ANNULE'].includes(statut)) {
+      throw new Error('Statut de rendez-vous invalide.')
+    }
+
+    return prisma.$transaction(async (tx) => {
+      const rendezVous = await tx.rendezVous.findUnique({
+        where: { id: rendezVousId },
+        include: { creneau: true }
+      })
+
+      if (!rendezVous || rendezVous.medecinId !== medecinId) {
+        throw new Error('Rendez-vous introuvable.')
+      }
+
+      if (rendezVous.statut !== 'EN_ATTENTE') {
+        throw new Error('Cette demande de rendez-vous ne peut plus être modifiée.')
+      }
+
+      if (statut === 'ANNULE' && rendezVous.creneauId && rendezVous.creneau) {
+        await tx.creneau.update({
+          where: { id: rendezVous.creneauId },
+          data: { disponible: true }
+        })
+      }
+
+      const updated = await tx.rendezVous.update({
+        where: { id: rendezVousId },
+        data: { statut },
+        include: {
+          patient: { include: { utilisateur: { select: { nom: true, prenom: true, telephone: true } } } },
+          creneau: true
+        }
+      })
+
+      return updated
+    })
+  }
+
+  /**
    * Crée un nouveau créneau de disponibilité pour le médecin.
    */
   static async creerCreneau(

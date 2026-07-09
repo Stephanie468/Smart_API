@@ -94,6 +94,51 @@ export const getPlanning = async (req: AuthenticatedRequest, res: Response) => {
 }
 
 /**
+ * Récupère la liste des demandes de rendez-vous en attente.
+ * GET /api/medecin/planning/demandes
+ */
+export const getDemandesRendezVous = async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const medecinId = req.user?.id
+    if (!medecinId) {
+      return res.status(401).json({ message: 'Non autorisé.' })
+    }
+
+    const demandes = await MedecinService.getDemandesRendezVous(medecinId)
+    return res.status(200).json(demandes)
+  } catch (error: any) {
+    console.error('[MedecinController.getDemandesRendezVous] Erreur :', error)
+    return res.status(500).json({ message: 'Erreur lors de la récupération des demandes de rendez-vous.' })
+  }
+}
+
+/**
+ * Valide ou rejette une demande de rendez-vous.
+ * PUT /api/medecin/planning/demandes/:id
+ */
+export const mettreAJourDemandeRendezVous = async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const medecinId = req.user?.id
+    if (!medecinId) {
+      return res.status(401).json({ message: 'Non autorisé.' })
+    }
+
+    const { statut } = req.body
+    const { id } = req.params
+
+    if (!id || !statut) {
+      return res.status(400).json({ message: 'Identifiant et statut requis.' })
+    }
+
+    const rendezVous = await MedecinService.mettreAJourStatutRendezVous(medecinId, id, statut)
+    return res.status(200).json({ message: 'Statut mis à jour.', rendezVous })
+  } catch (error: any) {
+    console.error('[MedecinController.mettreAJourDemandeRendezVous] Erreur :', error)
+    return res.status(500).json({ message: error.message || 'Erreur lors de la mise à jour de la demande de rendez-vous.' })
+  }
+}
+
+/**
  * Crée un nouveau créneau de disponibilité.
  * POST /api/medecin/planning/creneau
  */

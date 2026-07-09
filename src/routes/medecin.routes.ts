@@ -4,6 +4,8 @@ import {
   getPatients,
   validerPrescription,
   getPlanning,
+  getDemandesRendezVous,
+  mettreAJourDemandeRendezVous,
   creerCreneau
 } from '../controllers/medecin.controller.js'
 import { authentifierToken, exigerRole } from '../middlewares/auth.middleware.js'
@@ -25,6 +27,8 @@ medecinRoutes.post('/prescription', validerPrescription)
 
 // Gestion du planning
 medecinRoutes.get('/planning', getPlanning)
+medecinRoutes.get('/planning/demandes', getDemandesRendezVous)
+medecinRoutes.put('/planning/demandes/:id', mettreAJourDemandeRendezVous)
 medecinRoutes.post('/planning/creneau', creerCreneau)
 
 export default medecinRoutes
